@@ -377,6 +377,17 @@ func TestClosedRoomSilentToNonMembers(t *testing.T) {
 	if err != nil || replies != nil {
 		t.Fatalf("non-member = %v, %v, want silent", replies, err)
 	}
+
+	// The list must not advertise a closed room to a non-member; the member
+	// sees it normally.
+	replies = send(t, ".room list", bobKey, "bob", time.Unix(7002, 0))
+	if len(replies) != 1 || strings.Contains(replies[0], "main") {
+		t.Fatalf("non-member list = %v, want header only", replies)
+	}
+	replies = send(t, ".room list", aliceKey, "alice", time.Unix(7003, 0))
+	if len(replies) != 2 || !strings.Contains(replies[1], "main") {
+		t.Fatalf("member list = %v, want main listed", replies)
+	}
 }
 
 func TestReplayGuard(t *testing.T) {

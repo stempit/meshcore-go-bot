@@ -311,8 +311,10 @@ func roomWho(lang, room string) ([]string, error) {
 	return []string{tr.T(lang, "who", len(subs), strings.Join(subs, ", "), len(others), strings.Join(others, ", "))}, nil
 }
 
-// roomList shows every declared room with the caller's subscription state and
-// unread count. Listing never enrolls the caller in a room they haven't used.
+// roomList shows the declared rooms the caller may access, with their
+// subscription state and unread count. Closed rooms stay invisible to
+// non-members — the list must not advertise what they can't join.
+// Listing never enrolls the caller in a room they haven't used.
 func roomList(lang, keyHex string) ([]string, error) {
 	roomMu.Lock()
 	defer roomMu.Unlock()
@@ -320,6 +322,9 @@ func roomList(lang, keyHex string) ([]string, error) {
 	lines := make([]string, 0, len(conf.Rooms)+1)
 	lines = append(lines, tr.T(lang, "list.header"))
 	for _, name := range roomNames() {
+		if !isOpenRoom(name, keyHex) {
+			continue
+		}
 		state := tr.T(lang, "sub.off_short")
 		unreadN := 0
 		if s, err := loadStore(name); err == nil {
