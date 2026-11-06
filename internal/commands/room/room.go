@@ -25,9 +25,6 @@ var langFS embed.FS
 
 var tr = i18n.MustLoad(langFS)
 
-// nameClipRunes caps display names in rendered posts (mesh budget).
-const nameClipRunes = 10
-
 func init() { registry.Register(plugin{}) }
 
 type plugin struct{}
@@ -167,10 +164,11 @@ func roomSend(c registry.Ctx, room, keyHex, text string) ([]string, error) {
 		return []string{tr.T(c.Lang, "err.save")}, err
 	}
 	pushPost(c.Lang, room, s, p)
+	unread := s.st.unread(u)
 	if room != defaultRoom() {
-		return []string{tr.T(c.Lang, "sent.in", p.Seq, room, s.st.unread(u))}, nil
+		return []string{tr.T(c.Lang, "sent.in", p.Seq, room, unread)}, nil
 	}
-	return []string{tr.T(c.Lang, "sent", p.Seq, s.st.unread(u))}, nil
+	return []string{tr.T(c.Lang, "sent", p.Seq, unread)}, nil
 }
 
 // roomGet returns up to n unread posts (oldest first), advancing the user's
@@ -247,9 +245,10 @@ func roomStatus(lang, room, keyHex, name string) ([]string, error) {
 		return []string{tr.T(lang, "empty")}, nil
 	}
 	last := s.st.Posts[len(s.st.Posts)-1]
-	lines := []string{tr.T(lang, "status", room, subLabel(lang, u.Subscribed), s.st.unread(u), len(s.st.Posts))}
-	lines = append(lines, renderPost(lang, last))
-	return lines, nil
+	return []string{
+		tr.T(lang, "status", room, subLabel(lang, u.Subscribed), s.st.unread(u), len(s.st.Posts)),
+		renderPost(lang, last),
+	}, nil
 }
 
 // roomLast renders the last n posts regardless of cursors — history browsing.
@@ -325,20 +324,17 @@ func roomList(lang, keyHex string) ([]string, error) {
 		if !isOpenRoom(name, keyHex) {
 			continue
 		}
-		state := tr.T(lang, "sub.off_short")
-		unreadN := 0
-		if s, err := loadStore(name); err == nil {
-			if u, ok := s.st.Users[keyHex]; ok {
-				if u.Subscribed {
-					state = tr.T(lang, "sub.on_short")
-				}
-				unreadN = s.st.unread(u)
-			} else {
-				// Never touched the room: every post so far is unseen.
-				unreadN = s.st.NextSeq - 1
-			}
-		} else {
+		s, err := loadStore(name)
+		if err != nil {
 			return []string{tr.T(lang, "err.load")}, err
+		}
+		state := tr.T(lang, "sub.off_short")
+		unreadN := s.st.NextSeq - 1 // never touched the room: every post is unseen
+		if u, ok := s.st.Users[keyHex]; ok {
+			if u.Subscribed {
+				state = tr.T(lang, "sub.on_short")
+			}
+			unreadN = s.st.unread(u)
 		}
 		lines = append(lines, tr.T(lang, "list.line", name, state, unreadN))
 	}
@@ -348,7 +344,7 @@ func roomList(lang, keyHex string) ([]string, error) {
 // batchArg parses an optional "[n]" argument: the first integer field wins,
 // garbage or absence falls back to def.
 func batchArg(args string, def int) int {
-	if fields := strings.Fields(args); len(fields) >= 1 {
+	if fields := strings.Fields(args); len(fields) > 0 {
 		if v, err := strconv.Atoi(fields[0]); err == nil && v > 0 {
 			def = v
 		}

@@ -116,23 +116,24 @@ func roomNames() []string {
 	return names
 }
 
-// roomExists reports whether name is a declared room.
-func roomExists(name string) bool {
-	for _, r := range conf.Rooms {
-		if r.Name == name {
-			return true
+// findRoom returns the declaration of a declared room, nil when undeclared.
+func findRoom(name string) *roomDecl {
+	for i := range conf.Rooms {
+		if conf.Rooms[i].Name == name {
+			return &conf.Rooms[i]
 		}
 	}
-	return false
+	return nil
 }
+
+// roomExists reports whether name is a declared room.
+func roomExists(name string) bool { return findRoom(name) != nil }
 
 // maxPostsFor returns the room's history ring size (override or fallback,
 // default 200).
 func maxPostsFor(name string) int {
-	for _, r := range conf.Rooms {
-		if r.Name == name && r.MaxPosts > 0 {
-			return r.MaxPosts
-		}
+	if r := findRoom(name); r != nil && r.MaxPosts > 0 {
+		return r.MaxPosts
 	}
 	if conf.MaxPosts > 0 {
 		return conf.MaxPosts
@@ -158,23 +159,21 @@ func maxBatch() int {
 
 // isOpenRoom reports whether keyHex may use the named room: everyone unless
 // it is closed, and a closed room matches its allow list by lowercase-hex
-// prefix.
+// prefix. Undeclared rooms admit nobody.
 func isOpenRoom(name, keyHex string) bool {
-	for _, r := range conf.Rooms {
-		if r.Name != name {
-			continue
-		}
-		if !r.Closed {
-			return true
-		}
-		for _, k := range r.Allow {
-			if k != "" && strings.HasPrefix(keyHex, k) {
-				return true
-			}
-		}
+	r := findRoom(name)
+	if r == nil {
 		return false
 	}
-	return false // undeclared room: nobody
+	if !r.Closed {
+		return true
+	}
+	for _, k := range r.Allow {
+		if k != "" && strings.HasPrefix(keyHex, k) {
+			return true
+		}
+	}
+	return false
 }
 
 // isRoomName reports whether s has the shape of a room name (used for error

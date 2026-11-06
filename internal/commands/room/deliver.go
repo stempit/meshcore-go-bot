@@ -9,6 +9,9 @@ import (
 
 var log = logging.For("commands")
 
+// nameClipRunes caps display names in rendered posts (mesh budget).
+const nameClipRunes = 10
+
 // The room pushes posts to subscribers over ordinary DMs. A plugin cannot
 // reach the dispatcher directly, so the composition root injects a contact
 // lookup and a sender (the migrator/games injection pattern). Defaults are
