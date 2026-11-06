@@ -10,6 +10,7 @@ import (
 
 	"github.com/stempit/meshcore-go"
 	"github.com/stempit/meshcore-go-bot/internal/config"
+	"github.com/stempit/meshcore-go-bot/internal/shrink"
 	"github.com/stempit/meshcore-go-bot/internal/support/registry"
 )
 
@@ -570,14 +571,15 @@ func TestHelpIntercept(t *testing.T) {
 	conf.Enabled = true
 
 	// ".room help" must resolve through LocalizedHelp — the gate requires a
-	// non-empty Meta.HelpLong first.
+	// non-empty Meta.HelpLong first. The reported shrink name is shrink's
+	// HelpName so help text always splits (never the command's LLM variant).
 	ctx := dmCtx(".room help", aliceKey, "alice", time.Unix(9950, 0))
 	ctx.Cfg = config.Get()
 	replies, name, err := registry.Dispatch(ctx)
 	if err != nil {
 		t.Fatalf("Dispatch error: %v", err)
 	}
-	if name != "room" || len(replies) == 0 || !strings.Contains(replies[0], ".room send") {
-		t.Fatalf("help = %q, %v, %v — want localized long help", name, replies, err)
+	if name != shrink.HelpName || len(replies) == 0 || !strings.Contains(replies[0], ".room send") {
+		t.Fatalf("help = %q, %v, %v — want localized long help under the help variant", name, replies, err)
 	}
 }

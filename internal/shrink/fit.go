@@ -34,15 +34,25 @@ func resolveVariant(name string) fit.Variant {
 	return fit.Truncate
 }
 
+// HelpName is the shrink variant key for help output: the ".help" index and
+// every per-command long help reply. Help is structural content — a command
+// reference the sender asked for verbatim — so it is always split and never
+// LLM-compressed, regardless of Shrink config.
+const HelpName = "help"
+
 // OptionsFor resolves the fit options for a named send path from the Shrink
 // config section, variant overrides included.
 func OptionsFor(name string) fit.Options {
 	s := config.Get().Shrink
+	variant := resolveVariant(name)
+	if name == HelpName {
+		variant = fit.Split // help text survives verbatim, whatever the config says
+	}
 	o := fit.Options{
 		MaxBytes: s.MaxBytes,
 		Ellipsis: s.Ellipsis,
 		CyrToLat: s.CyrToLat,
-		Variant:  resolveVariant(name),
+		Variant:  variant,
 	}
 	if o.Variant == fit.LLM {
 		o.Compress = llmCompressor

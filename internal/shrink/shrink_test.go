@@ -222,3 +222,35 @@ func TestCyrToLatPrefixSqueezedAndFits(t *testing.T) {
 		checkAllFit(t, out, fit.CyrToLat(prefix))
 	})
 }
+
+// Help output is structural content: whatever the configured default (this
+// package's TestMain config is "llm") — and even an explicit override trying
+// to re-enable the LLM — the help variant must resolve to split with no LLM
+// compressor attached.
+func TestHelpAlwaysSplits(t *testing.T) {
+	if o := OptionsFor(HelpName); o.Variant != fit.Split || o.Compress != nil {
+		t.Fatalf("help options = %+v, want split without compressor", o)
+	}
+
+	cfg := config.Get()
+	overrides := cfg.Shrink.Overrides
+	if overrides == nil {
+		overrides = map[string]string{}
+	}
+	old, had := overrides[HelpName], false
+	if cfg.Shrink.Overrides == nil {
+		cfg.Shrink.Overrides = overrides
+	}
+	overrides[HelpName] = "llm"
+	t.Cleanup(func() {
+		if had {
+			overrides[HelpName] = old
+		} else {
+			delete(overrides, HelpName)
+		}
+	})
+
+	if o := OptionsFor(HelpName); o.Variant != fit.Split || o.Compress != nil {
+		t.Fatalf("help options with llm override = %+v, want split without compressor", o)
+	}
+}

@@ -79,6 +79,8 @@ Shrink:
   ellipsis: "…"           # appended by truncate
   cyr_to_lat: true        # lossless: swap Cyrillic letters for identical-looking ASCII (saves 1 byte each)
   overrides:              # per-command/source variant override
+    # NOTE: help output (".help" index and ".<cmd> help") is always split —
+    # it is a structural rule, an override cannot LLM-compress it.
     news: skip            # drop news items that don't fit
     last: truncate        # history lines: cut, don't LLM-shrink
     agent: split          # AI agent replies: numbered [i/N] parts
