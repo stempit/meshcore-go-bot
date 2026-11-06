@@ -188,12 +188,16 @@ func (s *roomState) user(keyHex, name string) *RoomUser {
 	return u
 }
 
-// unread counts the user's unseen posts. Pruned posts still count: a cursor
-// below the retained range means "saw everything older", not "more to fetch".
+// unread counts the user's unseen posts: newer than the cursor and not
+// authored by them — exactly the set get delivers, so every unread figure
+// (list, status, sub.on, the sent confirmation) agrees with what get does.
+// Own posts are skipped (and consumed) by get, never counted.
 func (s *roomState) unread(u *RoomUser) int {
-	n := s.NextSeq - 1 - u.Cursor
-	if n < 0 {
-		return 0
+	n := 0
+	for _, p := range s.Posts {
+		if p.Seq > u.Cursor && p.AuthorKey != u.Key {
+			n++
+		}
 	}
 	return n
 }

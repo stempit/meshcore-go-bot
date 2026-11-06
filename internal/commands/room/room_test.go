@@ -341,6 +341,34 @@ func TestGetSkipsOwnPostsAfterGap(t *testing.T) {
 	}
 }
 
+func TestUnreadExcludesOwnPosts(t *testing.T) {
+	testEnv(t)
+
+	// The reported bug: alice posts and never runs get — her own post must
+	// not count as unread anywhere (list used to show 1, get said none).
+	send(t, ".room send mine", aliceKey, "alice", time.Unix(9800, 0))
+
+	replies := send(t, ".room list", aliceKey, "alice", time.Unix(9801, 0))
+	if len(replies) != 2 || !strings.Contains(replies[1], "unread 0") {
+		t.Fatalf("list = %v, want own post not counted", replies)
+	}
+	replies = send(t, ".room get", aliceKey, "alice", time.Unix(9802, 0))
+	if len(replies) != 1 || !strings.Contains(replies[0], "No unread") {
+		t.Fatalf("get = %v, want none (own post only)", replies)
+	}
+
+	// Others' posts still count and get delivers exactly that set.
+	send(t, ".room send theirs", bobKey, "bob", time.Unix(9803, 0))
+	replies = send(t, ".room", aliceKey, "alice", time.Unix(9804, 0))
+	if len(replies) != 2 || !strings.Contains(replies[0], "unread 1") {
+		t.Fatalf("status = %v, want bob's post counted", replies)
+	}
+	replies = send(t, ".room get", aliceKey, "alice", time.Unix(9805, 0))
+	if len(replies) != 1 || !strings.Contains(replies[0], "theirs") {
+		t.Fatalf("get = %v, want bob's post", replies)
+	}
+}
+
 func TestGates(t *testing.T) {
 	testEnv(t)
 
