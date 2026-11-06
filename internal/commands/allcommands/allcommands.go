@@ -22,6 +22,7 @@ import (
 	_ "github.com/stempit/meshcore-go-bot/internal/commands/path"
 	_ "github.com/stempit/meshcore-go-bot/internal/commands/ping"
 	_ "github.com/stempit/meshcore-go-bot/internal/commands/poker"
+	_ "github.com/stempit/meshcore-go-bot/internal/commands/room"
 	_ "github.com/stempit/meshcore-go-bot/internal/commands/stat"
 	_ "github.com/stempit/meshcore-go-bot/internal/commands/ticket"
 	_ "github.com/stempit/meshcore-go-bot/internal/commands/top"

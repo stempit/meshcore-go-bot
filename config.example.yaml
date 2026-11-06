@@ -83,6 +83,7 @@ Shrink:
     last: truncate        # history lines: cut, don't LLM-shrink
     agent: split          # AI agent replies: numbered [i/N] parts
     bbs: split            # BBS posts must stay verbatim
+    room: split           # room posts must stay verbatim
     telegram: split       # bridged Telegram messages
   llm:                    # the "llm" variant (uses a light model to compress)
     # type: ollama        # optional; inherits LLM.type when empty
@@ -220,6 +221,21 @@ vote:
   max_options: 6     # max options per poll; 0 or unset = default 6
   # The results list is multi-line; to wrap (rather than truncate) it, add:
   #   Shrink.overrides.vote: split
+
+room:
+  # ".room" — a room-server analog on ordinary DMs: users post with
+  # ".room send <text>", read history with ".room get [n]" / ".room last [n]",
+  # and ".room on"/"off" subscribe/unsubscribe to new posts pushed as DMs.
+  # History and per-user cursors persist in log/room/room.json. Opt-in: stays
+  # off until enabled.
+  enabled: false
+  closed: false          # true = restrict the room to the `allow` keys; default false (open)
+  # allow: ["aabbcc"]    # lowercase-hex pubkey prefixes used when closed
+  max_posts: 200         # history ring; 0/unset = default 200 (oldest pruned)
+  get_batch: 10          # ".room get" default batch; 0/unset = default 10
+  max_batch: 20          # ".room get n" hard cap; 0/unset = default 20
+  # Posts must stay verbatim; to wrap (rather than truncate) overlong ones, add:
+  #   Shrink.overrides.room: split
 
 poker:
   # ".poker" — fixed-limit Texas Hold'em on a channel (2–6 players). The
