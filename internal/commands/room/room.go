@@ -58,38 +58,36 @@ func (plugin) Handle(c registry.Ctx) ([]string, error) {
 	}
 	keyHex := keyOf(c.SenderKey)
 
-	rest := strings.TrimSpace(c.Rest)
-	if rest == "" {
-		return roomStatus(c.Lang, defaultRoom(), keyHex, c.SenderName)
-	}
-
 	// Disambiguation: a verb always owns the first token, so reserved words
 	// can never be room names; anything else that resolves to a declared room
-	// selects it and the verb follows (".room secret send hi").
-	head, args := splitFirst(rest)
-	roomName := defaultRoom()
-	if !reservedVerbs[head] {
-		if !roomExists(head) {
-			if isRoomName(head) {
-				return []string{tr.T(c.Lang, "err.no_room")}, nil
-			}
-			return []string{tr.T(c.Lang, "unknown")}, nil
-		}
-		roomName = head
-		if args == "" {
-			return roomStatus(c.Lang, roomName, keyHex, c.SenderName)
-		}
-		head, args = splitFirst(args)
+	// selects it and the verb follows (".room secret send hi"). Bare input —
+	// no args at all, or just a room name — is the room's status.
+	head, args, roomName := "status", "", defaultRoom()
+	if rest := strings.TrimSpace(c.Rest); rest != "" {
+		head, args = splitFirst(rest)
 		if !reservedVerbs[head] {
-			return []string{tr.T(c.Lang, "unknown")}, nil
+			if !roomExists(head) {
+				if isRoomName(head) {
+					return []string{tr.T(c.Lang, "err.no_room")}, nil
+				}
+				return []string{tr.T(c.Lang, "unknown")}, nil
+			}
+			roomName = head
+			if args == "" {
+				head, args = "status", ""
+			} else if head, args = splitFirst(args); !reservedVerbs[head] {
+				return []string{tr.T(c.Lang, "unknown")}, nil
+			}
 		}
 	}
 
 	if head == "list" {
 		return roomList(c.Lang, keyHex)
 	}
-	// Closed rooms gate per room: silence toward non-members, like DMs from
-	// strangers (isOpenRoom consults the config, no store needed).
+	// Closed rooms gate per room BEFORE any room content is touched: silence
+	// toward non-members, like DMs from strangers (isOpenRoom consults the
+	// config, no store needed). Bare room names must not leak the status line
+	// or the last post.
 	if !isOpenRoom(roomName, keyHex) {
 		return nil, nil
 	}
@@ -137,10 +135,10 @@ func roomSend(c registry.Ctx, room, keyHex, text string) ([]string, error) {
 	defer roomMu.Unlock()
 	s, err := loadStore(room)
 	if err != nil {
-		return []string{tr.T(c.Lang, "err.load")}, err
+		return loadFail(c.Lang, room, err)
 	}
 	if c.PingMeta != nil {
-		id := msgID(keyHex, c.PingMeta.Timestamp)
+		id := msgID(keyHex, c.PingMeta.Timestamp, text)
 		if s.st.wasSeen(id) {
 			return nil, nil // replayed stored command: already posted
 		}
@@ -161,7 +159,7 @@ func roomSend(c registry.Ctx, room, keyHex, text string) ([]string, error) {
 	// posts they missed between their cursor and here must stay unread (their
 	// own post is skipped when they next run get).
 	if err := s.save(); err != nil {
-		return []string{tr.T(c.Lang, "err.save")}, err
+		return saveFail(c.Lang, err)
 	}
 	pushPost(c.Lang, room, s, p)
 	unread := s.st.unread(u)
@@ -180,9 +178,10 @@ func roomGet(lang, room, keyHex, name, args string) ([]string, error) {
 	defer roomMu.Unlock()
 	s, err := loadStore(room)
 	if err != nil {
-		return []string{tr.T(lang, "err.load")}, err
+		return loadFail(lang, room, err)
 	}
 	u := s.st.user(keyHex, name)
+	cursorBefore := u.Cursor
 
 	var msgs []string
 	for _, p := range s.st.Posts {
@@ -208,7 +207,11 @@ func roomGet(lang, room, keyHex, name, args string) ([]string, error) {
 		msgs = append(msgs, tr.T(lang, "get.more", remaining))
 	}
 	if err := s.save(); err != nil {
-		return msgs, err // posts are delivered; the cursor save failure is logged upstream
+		// The delivery did not happen (the dispatcher drops replies of errored
+		// handlers), so the advanced cursor would silently mark the posts read.
+		// Restore it: the next get re-delivers them.
+		u.Cursor = cursorBefore
+		return saveFail(lang, err)
 	}
 	return msgs, nil
 }
@@ -219,12 +222,12 @@ func roomSetSub(lang, room, keyHex, name string, on bool) ([]string, error) {
 	defer roomMu.Unlock()
 	s, err := loadStore(room)
 	if err != nil {
-		return []string{tr.T(lang, "err.load")}, err
+		return loadFail(lang, room, err)
 	}
 	u := s.st.user(keyHex, name)
 	u.Subscribed = on
 	if err := s.save(); err != nil {
-		return []string{tr.T(lang, "err.save")}, err
+		return saveFail(lang, err)
 	}
 	if on {
 		return []string{tr.T(lang, "sub.on", s.st.unread(u))}, nil
@@ -238,7 +241,7 @@ func roomStatus(lang, room, keyHex, name string) ([]string, error) {
 	defer roomMu.Unlock()
 	s, err := loadStore(room)
 	if err != nil {
-		return []string{tr.T(lang, "err.load")}, err
+		return loadFail(lang, room, err)
 	}
 	u := s.st.user(keyHex, name)
 	if len(s.st.Posts) == 0 {
@@ -259,7 +262,7 @@ func roomLast(lang, room, args string) ([]string, error) {
 	defer roomMu.Unlock()
 	s, err := loadStore(room)
 	if err != nil {
-		return []string{tr.T(lang, "err.load")}, err
+		return loadFail(lang, room, err)
 	}
 	if len(s.st.Posts) == 0 {
 		return []string{tr.T(lang, "empty")}, nil
@@ -281,7 +284,7 @@ func roomWho(lang, room string) ([]string, error) {
 	defer roomMu.Unlock()
 	s, err := loadStore(room)
 	if err != nil {
-		return []string{tr.T(lang, "err.load")}, err
+		return loadFail(lang, room, err)
 	}
 	if len(s.st.Users) == 0 {
 		return []string{tr.T(lang, "who.none")}, nil
@@ -326,10 +329,10 @@ func roomList(lang, keyHex string) ([]string, error) {
 		}
 		s, err := loadStore(name)
 		if err != nil {
-			return []string{tr.T(lang, "err.load")}, err
+			return loadFail(lang, name, err)
 		}
 		state := tr.T(lang, "sub.off_short")
-		unreadN := s.st.NextSeq - 1 // never touched the room: every post is unseen
+		unreadN := len(s.st.Posts) // never touched the room: every retained post is unseen
 		if u, ok := s.st.Users[keyHex]; ok {
 			if u.Subscribed {
 				state = tr.T(lang, "sub.on_short")
@@ -339,6 +342,20 @@ func roomList(lang, keyHex string) ([]string, error) {
 		lines = append(lines, tr.T(lang, "list.line", name, state, unreadN))
 	}
 	return lines, nil
+}
+
+// loadFail and saveFail turn store errors into the user-visible reply with a
+// nil error: the dispatcher drops a handler's replies when it returns an
+// error, so the localized text must travel as the reply and the cause is
+// logged here. Caller must hold roomMu (loadFail reports the room name).
+func loadFail(lang, room string, err error) ([]string, error) {
+	log().Error("room: load failed", "room", room, "error", err)
+	return []string{tr.T(lang, "err.load")}, nil
+}
+
+func saveFail(lang string, err error) ([]string, error) {
+	log().Error("room: save failed", "error", err)
+	return []string{tr.T(lang, "err.save")}, nil
 }
 
 // batchArg parses an optional "[n]" argument: the first integer field wins,

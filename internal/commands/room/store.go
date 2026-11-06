@@ -1,6 +1,7 @@
 package room
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -98,13 +99,16 @@ func loadStore(name string) (*store, error) {
 	}
 	file := roomPath(name)
 	data, err := os.ReadFile(file)
-	if errors.Is(err, os.ErrNotExist) {
-		// Either a fresh install or the atomic-save rename window: fall back
-		// to the previous generation kept by save.
-		data, err = os.ReadFile(file + ".bak")
-	}
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
+	}
+	if len(data) == 0 {
+		// Missing (fresh install) or zero-length (a torn rename without fsync
+		// can leave exactly this): the previous generation holds the last
+		// known good state.
+		if bak, bakErr := os.ReadFile(file + ".bak"); bakErr == nil {
+			data = bak
+		}
 	}
 	if len(data) == 0 {
 		s.st = newState()
@@ -202,6 +206,18 @@ func (s *roomState) unread(u *RoomUser) int {
 	return n
 }
 
+// hasPendingOthers reports whether the user has undelivered posts by other
+// authors strictly between the cursor and seq — the backlog a push must not
+// silently consume by advancing the cursor over it.
+func (s *roomState) hasPendingOthers(u *RoomUser, seq int) bool {
+	for _, p := range s.Posts {
+		if p.Seq > u.Cursor && p.Seq < seq && p.AuthorKey != u.Key {
+			return true
+		}
+	}
+	return false
+}
+
 // wasSeen reports whether the msg id is in the replay-guard ring. Caller holds
 // roomMu.
 func (s *roomState) wasSeen(id string) bool {
@@ -222,8 +238,11 @@ func (s *roomState) markSeen(id string) {
 }
 
 // msgID builds the replay-guard id for a DM: sender hex + sender-clock unix
-// seconds — the same tuple the driver's protocol-level dedup keys on, stable
-// across live reception and device-replayed sync.
-func msgID(keyHex string, ts time.Time) string {
-	return keyHex + "-" + strconv.FormatInt(ts.Unix(), 10)
+// seconds + text hash. The tuple mirrors the driver's protocol-level dedup
+// key (which also includes the text), staying stable across live reception
+// and device-replayed sync; the hash keeps two distinct posts sent within
+// the same second from colliding on the 1-second timestamp alone.
+func msgID(keyHex string, ts time.Time, text string) string {
+	sum := sha256.Sum256([]byte(text))
+	return keyHex + "-" + strconv.FormatInt(ts.Unix(), 10) + "-" + hex.EncodeToString(sum[:4])
 }

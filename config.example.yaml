@@ -79,13 +79,12 @@ Shrink:
   ellipsis: "…"           # appended by truncate
   cyr_to_lat: true        # lossless: swap Cyrillic letters for identical-looking ASCII (saves 1 byte each)
   overrides:              # per-command/source variant override
-    # NOTE: help output (".help" index and ".<cmd> help") is always split —
-    # it is a structural rule, an override cannot LLM-compress it.
+    # NOTE: help output (".help" index and ".<cmd> help") and .room posts are
+    # always split — structural rules; overrides cannot LLM-compress them.
     news: skip            # drop news items that don't fit
     last: truncate        # history lines: cut, don't LLM-shrink
     agent: split          # AI agent replies: numbered [i/N] parts
     bbs: split            # BBS posts must stay verbatim
-    room: split           # room posts must stay verbatim
     telegram: split       # bridged Telegram messages
   llm:                    # the "llm" variant (uses a light model to compress)
     # type: ollama        # optional; inherits LLM.type when empty
@@ -231,8 +230,9 @@ room:
   # Multiple named rooms: ".room <name> <verb> ..." (e.g. ".room secret send
   # hi"); a word that names a command always stays a command, so bare commands
   # always target the `default` room. ".room list" lists the rooms. Each room
-  # keeps its own history and cursors in log/room/<name>.json. Opt-in: stays
-  # off until enabled.
+  # keeps its own history and cursors in log/room/<name>.json (posts are
+  # always sent verbatim and split into parts — no Shrink override needed).
+  # Opt-in: stays off until enabled.
   enabled: false
   default: main          # room bare ".room ..." commands target; unlisted defaults are added open
   max_posts: 200         # history ring fallback; 0/unset = default 200 (oldest pruned)
@@ -244,8 +244,6 @@ room:
     #   closed: true       # restrict to the `allow` keys
     #   allow: ["aabbcc"]  # lowercase-hex pubkey prefixes
     #   max_posts: 100     # per-room ring override; 0/unset = the fallback above
-  # Posts must stay verbatim; to wrap (rather than truncate) overlong ones, add:
-  #   Shrink.overrides.room: split
 
 poker:
   # ".poker" — fixed-limit Texas Hold'em on a channel (2–6 players). The

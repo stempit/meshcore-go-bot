@@ -111,6 +111,8 @@ log/
   known.txt               – greeted node public keys (hex, one per line)
   news/<feed>.txt         – RSS items written by the separate newswire app (https://github.com/Stempit/newswire); read by .news
   alerts/<name>.txt       – ids of alert items already seen/announced, one file per configured source
+  room/<name>.json        – .room state: posts, cursors, replay-guard ring (one file per room, +.bak)
+  2ch/threads.json        – .2ch BBS threads (+.bak)
 ```
 
 ## Packages that need care

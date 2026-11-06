@@ -40,13 +40,19 @@ func resolveVariant(name string) fit.Variant {
 // LLM-compressed, regardless of Shrink config.
 const HelpName = "help"
 
+// RoomName is the shrink variant key for the .room plugin: posts are
+// user-authored content. They are always split, never LLM-compressed — an
+// LLM rewriting someone's message is a fidelity and privacy failure, and a
+// network round-trip inside the room's store lock would stall every command.
+const RoomName = "room"
+
 // OptionsFor resolves the fit options for a named send path from the Shrink
 // config section, variant overrides included.
 func OptionsFor(name string) fit.Options {
 	s := config.Get().Shrink
 	variant := resolveVariant(name)
-	if name == HelpName {
-		variant = fit.Split // help text survives verbatim, whatever the config says
+	if name == HelpName || name == RoomName {
+		variant = fit.Split // verbatim content survives, whatever the config says
 	}
 	o := fit.Options{
 		MaxBytes: s.MaxBytes,

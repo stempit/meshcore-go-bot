@@ -496,6 +496,21 @@ func TestBakRecovery(t *testing.T) {
 	if len(s.st.Posts) != 1 || s.st.Posts[0].Text != "one" {
 		t.Fatalf("recovered posts = %+v, want .bak generation", s.st.Posts)
 	}
+
+	// A zero-length main file (torn rename) recovers from .bak the same way.
+	if err := os.WriteFile(roomPath(defaultRoom()), nil, 0o644); err != nil {
+		t.Fatalf("truncate main file: %v", err)
+	}
+	roomMu.Lock()
+	delete(stores, defaultRoom())
+	s, err = loadStore(defaultRoom())
+	roomMu.Unlock()
+	if err != nil {
+		t.Fatalf("load after truncate: %v", err)
+	}
+	if len(s.st.Posts) != 1 || s.st.Posts[0].Text != "one" {
+		t.Fatalf("posts after truncate recovery = %+v, want .bak generation", s.st.Posts)
+	}
 }
 
 func TestRoundTripJSON(t *testing.T) {
@@ -556,6 +571,16 @@ func TestNormalize(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "must match") {
 		t.Fatalf("bad charset error = %v", err)
 	}
+	// empty allow entries are a config typo, not an open door
+	err = normalize(&cfg{Rooms: []roomDecl{{Name: "a", Closed: true, Allow: []string{""}}}})
+	if err == nil || !strings.Contains(err.Error(), "empty allow") {
+		t.Fatalf("empty allow error = %v", err)
+	}
+	// the appended default must pass the same checks as a listed room
+	err = normalize(&cfg{Default: "../evil"})
+	if err == nil || !strings.Contains(err.Error(), "default") {
+		t.Fatalf("bad default error = %v", err)
+	}
 	// implicit default room appended, names normalized
 	c := &cfg{Rooms: []roomDecl{{Name: " Secret "}}}
 	if err := normalize(c); err != nil {
@@ -609,5 +634,114 @@ func TestHelpIntercept(t *testing.T) {
 	}
 	if name != shrink.HelpName || len(replies) == 0 || !strings.Contains(replies[0], ".room send") {
 		t.Fatalf("help = %q, %v, %v — want localized long help under the help variant", name, replies, err)
+	}
+}
+
+func TestClosedRoomBareNameSilent(t *testing.T) {
+	testEnv(t)
+	setConf(t, func(c *cfg) {
+		c.Rooms = []roomDecl{{Name: "main", Closed: true, Allow: []string{"aa01"}}}
+	})
+
+	// The bare room name maps to status and must pass the same closed-room
+	// gate as the explicit verb: silent for non-members (used to leak the
+	// status line plus the last post).
+	replies, err := plugin{}.Handle(dmCtx(".room", bobKey, "bob", time.Unix(7500, 0)))
+	if err != nil || replies != nil {
+		t.Fatalf("non-member bare name = %v, %v, want silent", replies, err)
+	}
+	send(t, ".room send hi", aliceKey, "alice", time.Unix(7501, 0))
+	replies = send(t, ".room", aliceKey, "alice", time.Unix(7502, 0))
+	if len(replies) != 2 || !strings.Contains(replies[0], "main") {
+		t.Fatalf("member bare name = %v, want main's status", replies)
+	}
+}
+
+func TestPushDoesNotEraseBacklog(t *testing.T) {
+	sink := testEnv(t)
+
+	// Backlog first: alice posts twice while bob is not subscribed.
+	send(t, ".room send b1post", aliceKey, "alice", time.Unix(9100, 0))
+	send(t, ".room send b2post", aliceKey, "alice", time.Unix(9101, 0))
+
+	// Bob subscribes (told unread 2), then a new post is pushed to him.
+	replies := send(t, ".room on", bobKey, "bob", time.Unix(9102, 0))
+	if len(replies) != 1 || !strings.Contains(replies[0], "2") {
+		t.Fatalf("sub.on = %v, want unread 2", replies)
+	}
+	send(t, ".room send b3post", aliceKey, "alice", time.Unix(9103, 0))
+	if got := sink(); len(got) != 1 || !strings.Contains(got[0].text, "b3post") {
+		t.Fatalf("pushes = %v, want b3post pushed", got)
+	}
+
+	// The push must not consume the backlog: get delivers all three posts.
+	replies = send(t, ".room get", bobKey, "bob", time.Unix(9104, 0))
+	if len(replies) != 3 || !strings.Contains(replies[0], "b1post") || !strings.Contains(replies[2], "b3post") {
+		t.Fatalf("get after push = %v, want backlog plus the pushed post", replies)
+	}
+}
+
+func TestSaveFailureRepliesAndRestoresCursor(t *testing.T) {
+	testEnv(t)
+
+	send(t, ".room send one", aliceKey, "alice", time.Unix(9400, 0)) // seeds the store
+	// Block the next saves: the temp target of the atomic write is a directory.
+	blocker := roomPath(defaultRoom()) + ".tmp"
+	if err := os.Mkdir(blocker, 0o755); err != nil {
+		t.Fatalf("create blocker: %v", err)
+	}
+	t.Cleanup(func() { os.Remove(blocker) })
+
+	// The dispatcher drops replies of errored handlers, so a failed save must
+	// come back as the error TEXT with a nil error.
+	replies := send(t, ".room get", bobKey, "bob", time.Unix(9401, 0))
+	if len(replies) != 1 || !strings.Contains(replies[0], "cannot save room") {
+		t.Fatalf("get reply = %v, want save error text", replies)
+	}
+	replies = send(t, ".room send two", aliceKey, "alice", time.Unix(9402, 0))
+	if len(replies) != 1 || !strings.Contains(replies[0], "cannot save room") {
+		t.Fatalf("send reply = %v, want save error text", replies)
+	}
+
+	// The failed get must not have consumed the post: with the blocker gone,
+	// get re-delivers everything (the cursor was restored, and the in-memory
+	// post from the failed send survives to the next successful save).
+	os.Remove(blocker)
+	replies = send(t, ".room get", bobKey, "bob", time.Unix(9403, 0))
+	if len(replies) != 2 || !strings.Contains(replies[0], "one") || !strings.Contains(replies[1], "two") {
+		t.Fatalf("get after blocker removed = %v, want both posts", replies)
+	}
+}
+
+func TestReplayGuardSameSecond(t *testing.T) {
+	testEnv(t)
+	ts := time.Unix(8200, 0)
+
+	// Two distinct posts within the same 1-second timestamp must both land;
+	// only the identical (text, timestamp) replay is swallowed.
+	first := send(t, ".room send alpha", aliceKey, "alice", ts)
+	second := send(t, ".room send beta", aliceKey, "alice", ts)
+	if len(first) != 1 || len(second) != 1 || !strings.Contains(second[0], "[2]") {
+		t.Fatalf("same-second sends = %v / %v, want both posted", first, second)
+	}
+	replay := send(t, ".room send alpha", aliceKey, "alice", ts)
+	if replay != nil {
+		t.Fatalf("replayed alpha = %v, want silent skip", replay)
+	}
+}
+
+func TestListUnreadCountsRetainedPosts(t *testing.T) {
+	testEnv(t)
+	setConf(t, func(c *cfg) { c.MaxPosts = 3 })
+
+	for i, ts := range []int64{9250, 9251, 9252, 9253, 9254} {
+		send(t, ".room send p"+string(rune('a'+i)), aliceKey, "alice", time.Unix(ts, 0))
+	}
+
+	// bob never touched the room: unread is the retained-post count, not the
+	// number of posts ever made (pruned posts are undeliverable).
+	replies := send(t, ".room list", bobKey, "bob", time.Unix(9255, 0))
+	if len(replies) != 2 || !strings.Contains(replies[1], "unread 3") {
+		t.Fatalf("list = %v, want retained-count 3", replies)
 	}
 }

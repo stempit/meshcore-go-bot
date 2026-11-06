@@ -155,6 +155,9 @@ func main() {
 	// contact lookup and the dispatcher's DM sender the same way.
 	room.SetDelivery(
 		func(rawKey string) *meshcore.Contact {
+			if rawKey == "" { // undecodable store key: an empty prefix matches every contact
+				return nil
+			}
 			return client.FindContactByKeyPrefix([]byte(rawKey)[:min(6, len(rawKey))])
 		},
 		d.SendDirectMessage)
@@ -312,20 +315,25 @@ drainLoop:
 	// The driver recreates incomingCh on every reconnect (startWith) but leaves
 	// the old one open (markDisconnected), so a plain `range` parks forever on
 	// the stale channel after the first reconnect and the pipeline silently
-	// stalls. Re-evaluate IncomingMessages() each iteration and wake the parked
-	// select on a ticker: after a reconnect the loop picks up the new channel
-	// within one tick; messages that arrive in between buffer in incomingCh.
+	// stalls. Re-acquire the channel on every tick: a stale channel is swapped
+	// for the new one within one tick, and a closed one (a reconnect whose
+	// handshake failed makes the driver Disconnect) nils out — a nil channel
+	// never fires in a select — until the next tick picks up the replacement.
+	// Messages arriving in between buffer in the driver's incomingCh.
 	go func() {
 		tick := time.NewTicker(10 * time.Second)
 		defer tick.Stop()
+		ch := client.IncomingMessages()
 		for {
 			select {
-			case msg, ok := <-client.IncomingMessages():
+			case msg, ok := <-ch:
 				if !ok {
-					return // Disconnect() closes the channel
+					ch = nil
+					continue
 				}
 				d.Submit(msg)
 			case <-tick.C:
+				ch = client.IncomingMessages()
 			case <-ctx.Done():
 				return
 			}

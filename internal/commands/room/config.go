@@ -89,6 +89,9 @@ func normalize(c *cfg) error {
 		seen[r.Name] = true
 		for j, k := range r.Allow {
 			r.Allow[j] = strings.ToLower(strings.TrimSpace(k))
+			if r.Allow[j] == "" {
+				return fmt.Errorf("room: %s: empty allow entry", r.Name)
+			}
 		}
 		if r.Closed && len(r.Allow) == 0 {
 			return fmt.Errorf("room: %s: closed needs at least one allow key, otherwise nobody could use it", r.Name)
@@ -96,7 +99,11 @@ func normalize(c *cfg) error {
 	}
 	if !seen[c.Default] {
 		// Bare ".room" commands need a target: append the unlisted default as
-		// an open room so a minimal config just works.
+		// an open room so a minimal config just works. It must pass the same
+		// checks as a listed room — this name also becomes a filename.
+		if !roomNameRe.MatchString(c.Default) || reservedVerbs[c.Default] {
+			return fmt.Errorf("room: default %q must match [a-z0-9_-]{1,12} and must not be a command word", c.Default)
+		}
 		c.Rooms = append(c.Rooms, roomDecl{Name: c.Default})
 	}
 	return nil

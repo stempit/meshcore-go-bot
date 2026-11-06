@@ -254,3 +254,11 @@ func TestHelpAlwaysSplits(t *testing.T) {
 		t.Fatalf("help options with llm override = %+v, want split without compressor", o)
 	}
 }
+
+// Room content (the .room plugin's name) is user-authored: split always,
+// never the LLM, mirroring the help rule.
+func TestRoomContentAlwaysSplits(t *testing.T) {
+	if o := OptionsFor(RoomName); o.Variant != fit.Split || o.Compress != nil {
+		t.Fatalf("room options = %+v, want split without compressor", o)
+	}
+}

@@ -63,8 +63,15 @@ func pushPost(lang, room string, s *store, p RoomPost) {
 	if room != defaultRoom() {
 		rendered = "[" + room + "] " + rendered
 	}
+	// Fit once for all subscribers: identical text, identical parts.
+	parts := shrink.Fit("room", "", []string{rendered})
 	for _, u := range s.st.Users {
 		if !u.Subscribed || u.Key == p.AuthorKey {
+			continue
+		}
+		// A room closed after someone subscribed stops pushing to them too —
+		// closed means closed, not only at command time.
+		if !isOpenRoom(room, u.Key) {
 			continue
 		}
 		contact := lookupContact(rawKeyOf(u.Key))
@@ -72,9 +79,14 @@ func pushPost(lang, room string, s *store, p RoomPost) {
 			log().Warn("room: push skipped, contact not found", "room", room, "key", u.Key, "seq", p.Seq)
 			continue
 		}
-		for _, part := range shrink.Fit("room", "", []string{rendered}) {
+		for _, part := range parts {
 			sendDM(contact, part, true)
 		}
-		u.Cursor = p.Seq
+		// Advance the cursor only when nothing else is pending: a subscriber
+		// with a backlog must not lose it to this push (get re-delivers the
+		// pushed post along with the backlog — duplication beats data loss).
+		if !s.st.hasPendingOthers(u, p.Seq) {
+			u.Cursor = p.Seq
+		}
 	}
 }
