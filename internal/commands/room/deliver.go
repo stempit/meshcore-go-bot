@@ -48,20 +48,25 @@ func authorLabel(p RoomPost) string {
 	return p.AuthorKey
 }
 
-// pushPost delivers a post to every subscriber except its author. Delivery is
-// best-effort: a subscriber whose contact the device no longer knows is
-// skipped with their cursor left untouched, so ".room get" delivers the post
-// to them later; drops on a full outgoing queue are logged by the send layer.
+// pushPost delivers a post to every subscriber except its author. Pushes from
+// non-default rooms carry a "[name] " prefix — unsolicited DMs from several
+// rooms are indistinguishable otherwise. Delivery is best-effort: a subscriber
+// whose contact the device no longer knows is skipped with their cursor left
+// untouched, so ".room get" delivers the post to them later; drops on a full
+// outgoing queue are logged by the send layer.
 // Caller must hold roomMu (cursor updates mutate the store).
-func pushPost(lang string, p RoomPost) {
+func pushPost(lang, room string, s *store, p RoomPost) {
 	rendered := renderPost(lang, p)
-	for _, u := range state.Users {
+	if room != defaultRoom() {
+		rendered = "[" + room + "] " + rendered
+	}
+	for _, u := range s.st.Users {
 		if !u.Subscribed || u.Key == p.AuthorKey {
 			continue
 		}
 		contact := lookupContact(rawKeyOf(u.Key))
 		if contact == nil {
-			log().Warn("room: push skipped, contact not found", "key", u.Key, "seq", p.Seq)
+			log().Warn("room: push skipped, contact not found", "room", room, "key", u.Key, "seq", p.Seq)
 			continue
 		}
 		for _, part := range shrink.Fit("room", "", []string{rendered}) {

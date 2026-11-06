@@ -5,17 +5,17 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
 )
 
-// The room state lives under log/room; vars (not consts) so tests can redirect
-// them.
+// Room state lives under log/room, one file per room; roomDir is a var (not a
+// const) so tests can redirect it.
 var (
 	roomDir     = "log/room"
-	roomFile    = "log/room/room.json"
-	seenRingCap = 64 // replay-guard memory: recent "key-timestamp" ids
+	seenRingCap = 64 // replay-guard memory: recent "key-timestamp" ids per room
 )
 
 // RoomPost is one room message.
@@ -36,10 +36,10 @@ type RoomUser struct {
 	Cursor     int    `json:"cursor"`
 }
 
-// roomState is the persisted store: the post history ring, per-user cursors,
-// and the replay-guard ring. The ring layout follows the bbs store (atomic
-// save + .bak generation), but the room history is append-only — prune drops
-// the oldest posts, cursors pointing into pruned range stay valid (they only
+// roomState is one room's persisted store: the post history ring, per-user
+// cursors, and the replay-guard ring. The layout follows the bbs store
+// (atomic save + .bak generation); history is append-only — prune drops the
+// oldest posts, cursors pointing into pruned range stay valid (they only
 // ever count).
 type roomState struct {
 	Posts   []RoomPost           `json:"posts"`
@@ -48,10 +48,17 @@ type roomState struct {
 	Seen    []string             `json:"seen"` // replay guard: recent msg ids
 }
 
+// store is one room's in-memory view, lazily loaded on first touch. All
+// stores share roomMu.
+type store struct {
+	name   string
+	st     *roomState
+	loaded bool
+}
+
 var (
-	roomMu     sync.Mutex
-	state      *roomState
-	roomLoaded bool
+	roomMu sync.Mutex
+	stores = map[string]*store{} // room name → lazy store
 )
 
 // keyOf normalizes the DM SenderKey flavor (raw public-key bytes) into the
@@ -70,39 +77,50 @@ func rawKeyOf(keyHex string) string {
 	return string(raw)
 }
 
-// roomLoad loads the store from disk if not already loaded. Caller must hold
-// roomMu.
-func roomLoad() error {
-	if roomLoaded {
-		return nil
+// roomPath is the store file for a room: log/room/<name>.json.
+func roomPath(name string) string {
+	return filepath.Join(roomDir, name+".json")
+}
+
+// loadStore returns the room's store, loading it from disk on first touch.
+// Caller must hold roomMu.
+func loadStore(name string) (*store, error) {
+	s, ok := stores[name]
+	if !ok {
+		s = &store{name: name}
+		stores[name] = s
+	}
+	if s.loaded {
+		return s, nil
 	}
 	if err := os.MkdirAll(roomDir, 0o755); err != nil {
-		return err
+		return nil, err
 	}
-	data, err := os.ReadFile(roomFile)
+	file := roomPath(name)
+	data, err := os.ReadFile(file)
 	if errors.Is(err, os.ErrNotExist) {
 		// Either a fresh install or the atomic-save rename window: fall back
-		// to the previous generation kept by roomSave.
-		data, err = os.ReadFile(roomFile + ".bak")
+		// to the previous generation kept by save.
+		data, err = os.ReadFile(file + ".bak")
 	}
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+		return nil, err
 	}
 	if len(data) == 0 {
-		state = newState()
-		roomLoaded = true
-		return nil
+		s.st = newState()
+		s.loaded = true
+		return s, nil
 	}
 	st := newState()
 	if err := json.Unmarshal(data, st); err != nil {
 		// The main file is corrupt; try the previous generation before
-		// giving up (roomSave keeps one around).
-		bak, bakErr := os.ReadFile(roomFile + ".bak")
+		// giving up (save keeps one around).
+		bak, bakErr := os.ReadFile(file + ".bak")
 		if bakErr != nil {
-			return err
+			return nil, err
 		}
 		if bakErr := json.Unmarshal(bak, st); bakErr != nil {
-			return err // both generations unreadable
+			return nil, err // both generations unreadable
 		}
 	}
 	if st.Users == nil {
@@ -111,9 +129,9 @@ func roomLoad() error {
 	if st.NextSeq < 1 {
 		st.NextSeq = 1
 	}
-	state = st
-	roomLoaded = true
-	return nil
+	s.st = st
+	s.loaded = true
+	return s, nil
 }
 
 // newState returns an empty store with the sequence watermark at 1.
@@ -121,47 +139,48 @@ func newState() *roomState {
 	return &roomState{Users: map[string]*RoomUser{}, NextSeq: 1}
 }
 
-// roomSave serialises the store to disk. Caller must hold roomMu. The write
-// is atomic (temp file + rename) with the previous generation kept as .bak —
+// save serialises the store to disk. Caller must hold roomMu. The write is
+// atomic (temp file + rename) with the previous generation kept as .bak —
 // same scheme as the bbs store: these nodes run unattended and a crash
 // mid-write must not lose the room.
-func roomSave() error {
-	prunePosts()
-	data, err := json.MarshalIndent(state, "", "  ")
+func (s *store) save() error {
+	s.prune()
+	data, err := json.MarshalIndent(s.st, "", "  ")
 	if err != nil {
 		return err
 	}
 	if err := os.MkdirAll(roomDir, 0o755); err != nil {
 		return err
 	}
-	tmp := roomFile + ".tmp"
+	file := roomPath(s.name)
+	tmp := file + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		return err
 	}
-	if err := os.Rename(roomFile, roomFile+".bak"); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := os.Rename(file, file+".bak"); err != nil && !errors.Is(err, os.ErrNotExist) {
 		os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, roomFile)
+	return os.Rename(tmp, file)
 }
 
-// prunePosts caps history growth: beyond the configured max the oldest posts
-// are dropped. Caller holds roomMu.
-func prunePosts() {
-	max := maxPosts()
-	if len(state.Posts) <= max {
+// prune caps history growth: beyond the room's configured max the oldest
+// posts are dropped. Caller holds roomMu.
+func (s *store) prune() {
+	max := maxPostsFor(s.name)
+	if len(s.st.Posts) <= max {
 		return
 	}
-	state.Posts = state.Posts[len(state.Posts)-max:]
+	s.st.Posts = s.st.Posts[len(s.st.Posts)-max:]
 }
 
 // user returns the participant record for keyHex, creating (and naming) one on
 // first contact. Caller holds roomMu.
-func user(keyHex, name string) *RoomUser {
-	u, ok := state.Users[keyHex]
+func (s *roomState) user(keyHex, name string) *RoomUser {
+	u, ok := s.Users[keyHex]
 	if !ok {
 		u = &RoomUser{Key: keyHex}
-		state.Users[keyHex] = u
+		s.Users[keyHex] = u
 	}
 	if name != "" {
 		u.Name = name
@@ -171,27 +190,19 @@ func user(keyHex, name string) *RoomUser {
 
 // unread counts the user's unseen posts. Pruned posts still count: a cursor
 // below the retained range means "saw everything older", not "more to fetch".
-func unread(u *RoomUser) int {
-	n := state.NextSeq - 1 - u.Cursor
+func (s *roomState) unread(u *RoomUser) int {
+	n := s.NextSeq - 1 - u.Cursor
 	if n < 0 {
 		return 0
 	}
 	return n
 }
 
-// lastSeq returns the newest post's sequence number (0 for an empty room).
-func lastSeq() int {
-	if n := len(state.Posts); n > 0 {
-		return state.Posts[n-1].Seq
-	}
-	return 0
-}
-
 // wasSeen reports whether the msg id is in the replay-guard ring. Caller holds
 // roomMu.
-func wasSeen(id string) bool {
-	for _, s := range state.Seen {
-		if s == id {
+func (s *roomState) wasSeen(id string) bool {
+	for _, id2 := range s.Seen {
+		if id2 == id {
 			return true
 		}
 	}
@@ -199,10 +210,10 @@ func wasSeen(id string) bool {
 }
 
 // markSeen records the msg id in the replay-guard ring. Caller holds roomMu.
-func markSeen(id string) {
-	state.Seen = append(state.Seen, id)
-	if len(state.Seen) > seenRingCap {
-		state.Seen = state.Seen[len(state.Seen)-seenRingCap:]
+func (s *roomState) markSeen(id string) {
+	s.Seen = append(s.Seen, id)
+	if len(s.Seen) > seenRingCap {
+		s.Seen = s.Seen[len(s.Seen)-seenRingCap:]
 	}
 }
 

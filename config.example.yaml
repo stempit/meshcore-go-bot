@@ -226,14 +226,22 @@ room:
   # ".room" — a room-server analog on ordinary DMs: users post with
   # ".room send <text>", read history with ".room get [n]" / ".room last [n]",
   # and ".room on"/"off" subscribe/unsubscribe to new posts pushed as DMs.
-  # History and per-user cursors persist in log/room/room.json. Opt-in: stays
+  # Multiple named rooms: ".room <name> <verb> ..." (e.g. ".room secret send
+  # hi"); a word that names a command always stays a command, so bare commands
+  # always target the `default` room. ".room list" lists the rooms. Each room
+  # keeps its own history and cursors in log/room/<name>.json. Opt-in: stays
   # off until enabled.
   enabled: false
-  closed: false          # true = restrict the room to the `allow` keys; default false (open)
-  # allow: ["aabbcc"]    # lowercase-hex pubkey prefixes used when closed
-  max_posts: 200         # history ring; 0/unset = default 200 (oldest pruned)
+  default: main          # room bare ".room ..." commands target; unlisted defaults are added open
+  max_posts: 200         # history ring fallback; 0/unset = default 200 (oldest pruned)
   get_batch: 10          # ".room get" default batch; 0/unset = default 10
   max_batch: 20          # ".room get n" hard cap; 0/unset = default 20
+  rooms:                 # extra rooms; the default need not be listed
+    # - name: lounge
+    # - name: secret
+    #   closed: true       # restrict to the `allow` keys
+    #   allow: ["aabbcc"]  # lowercase-hex pubkey prefixes
+    #   max_posts: 100     # per-room ring override; 0/unset = the fallback above
   # Posts must stay verbatim; to wrap (rather than truncate) overlong ones, add:
   #   Shrink.overrides.room: split
 

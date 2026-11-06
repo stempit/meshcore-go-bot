@@ -1,8 +1,11 @@
 // Package room is a room-server analog running on ordinary DMs: users post
 // with ".room send", read history with ".room get"/"last", and subscribe to
-// new-post delivery with ".room on"/"off". Posts are stored bot-side with a
-// per-user cursor; ".room on" subscribers receive every new post as a DM,
-// everyone else accumulates unread posts until their next ".room get".
+// new-post delivery with ".room on"/"off". Multiple named rooms are supported:
+// the first token after the trigger selects the room unless it is a verb
+// (".room secret send hi"), so bare commands always target the default room.
+// Posts are stored bot-side with per-room, per-user cursors; subscribers
+// receive every new post as a DM, everyone else accumulates unread posts
+// until their next ".room get".
 package room
 
 import (
@@ -34,10 +37,10 @@ func (plugin) Meta() registry.Meta {
 		Name:      "room",
 		Triggers:  []string{".room"},
 		Match:     registry.Prefix,
-		HelpShort: "shared room: post, read, subscribe",
+		HelpShort: "shared rooms: post, read, subscribe",
 		// HelpLong must be non-empty for ".room help" to intercept; the
 		// localized catalog overrides it via LocalizedHelp.
-		HelpLong: ".room - room status (subscribed? unread? last post)\n.room send <text> - post to the room\n.room get [n] - fetch unread posts (default 10)\n.room last [n] - read last posts\n.room on / .room off - subscribe / unsubscribe to new posts\n.room who - who is in the room",
+		HelpLong: ".room - room status (subscribed? unread? last post)\n.room send <text> - post to the room\n.room get [n] - fetch unread posts (default 10)\n.room last [n] - read last posts\n.room on / .room off - subscribe / unsubscribe to new posts\n.room who - who is in the room\n.room list - list rooms\n.room <name> <verb> ... - run the command in another room",
 		Group:    "Service",
 	}
 }
@@ -57,90 +60,134 @@ func (plugin) Handle(c registry.Ctx) ([]string, error) {
 		return []string{tr.T(c.Lang, "need_key")}, nil
 	}
 	keyHex := keyOf(c.SenderKey)
-	if !isOpen(keyHex) {
-		return nil, nil // closed room: stay silent toward non-members
-	}
 
 	rest := strings.TrimSpace(c.Rest)
-	lower := strings.ToLower(rest)
-	// Sub-verb matching follows the registry prefix rule: exact, or the verb
-	// followed by a space — so ".room getter" is not parsed as ".room get ter".
-	switch {
-	case lower == "" || lower == "status":
-		return roomStatus(c.Lang, keyHex, c.SenderName), nil
-	case lower == "get" || strings.HasPrefix(lower, "get "):
-		return roomGet(c.Lang, keyHex, c.SenderName, rest)
-	case lower == "send" || strings.HasPrefix(lower, "send "):
-		return roomSend(c, keyHex, rest)
-	case lower == "on":
-		return roomSetSub(c.Lang, keyHex, c.SenderName, true), nil
-	case lower == "off":
-		return roomSetSub(c.Lang, keyHex, c.SenderName, false), nil
-	case lower == "last" || strings.HasPrefix(lower, "last "):
-		return roomLast(c.Lang, rest)
-	case lower == "who":
-		return roomWho(c.Lang), nil
+	if rest == "" {
+		return roomStatus(c.Lang, defaultRoom(), keyHex, c.SenderName)
+	}
+
+	// Disambiguation: a verb always owns the first token, so reserved words
+	// can never be room names; anything else that resolves to a declared room
+	// selects it and the verb follows (".room secret send hi").
+	head, args := splitFirst(rest)
+	roomName := defaultRoom()
+	if !reservedVerbs[head] {
+		if !roomExists(head) {
+			if isRoomName(head) {
+				return []string{tr.T(c.Lang, "err.no_room")}, nil
+			}
+			return []string{tr.T(c.Lang, "unknown")}, nil
+		}
+		roomName = head
+		if args == "" {
+			return roomStatus(c.Lang, roomName, keyHex, c.SenderName)
+		}
+		head, args = splitFirst(args)
+		if !reservedVerbs[head] {
+			return []string{tr.T(c.Lang, "unknown")}, nil
+		}
+	}
+
+	if head == "list" {
+		return roomList(c.Lang, keyHex)
+	}
+	// Closed rooms gate per room: silence toward non-members, like DMs from
+	// strangers (isOpenRoom consults the config, no store needed).
+	if !isOpenRoom(roomName, keyHex) {
+		return nil, nil
+	}
+
+	switch head {
+	case "status":
+		return roomStatus(c.Lang, roomName, keyHex, c.SenderName)
+	case "get":
+		return roomGet(c.Lang, roomName, keyHex, c.SenderName, args)
+	case "send":
+		return roomSend(c, roomName, keyHex, args)
+	case "on":
+		return roomSetSub(c.Lang, roomName, keyHex, c.SenderName, true)
+	case "off":
+		return roomSetSub(c.Lang, roomName, keyHex, c.SenderName, false)
+	case "last":
+		return roomLast(c.Lang, roomName, args)
+	case "who":
+		return roomWho(c.Lang, roomName)
 	default:
 		return []string{tr.T(c.Lang, "unknown")}, nil
 	}
 }
 
-// roomSend appends a post, marks the author current, and pushes to
+// splitFirst cuts the leading word off rest: the lowercased head and the
+// trimmed remainder ("" when none).
+func splitFirst(rest string) (head, args string) {
+	fields := strings.SplitN(rest, " ", 2)
+	head = strings.ToLower(fields[0])
+	if len(fields) == 2 {
+		args = strings.TrimSpace(fields[1])
+	}
+	return head, args
+}
+
+// roomSend appends a post, marks the store current, and pushes to
 // subscribers. The author's message timestamp keys the replay guard: a stored
 // command redelivered by the device after a restart must not post twice.
-func roomSend(c registry.Ctx, keyHex, rest string) ([]string, error) {
-	text := strings.TrimSpace(rest[len("send"):])
+func roomSend(c registry.Ctx, room, keyHex, text string) ([]string, error) {
 	if text == "" {
 		return []string{tr.T(c.Lang, "usage.send")}, nil
 	}
 
 	roomMu.Lock()
 	defer roomMu.Unlock()
-	if err := roomLoad(); err != nil {
+	s, err := loadStore(room)
+	if err != nil {
 		return []string{tr.T(c.Lang, "err.load")}, err
 	}
 	if c.PingMeta != nil {
 		id := msgID(keyHex, c.PingMeta.Timestamp)
-		if wasSeen(id) {
+		if s.st.wasSeen(id) {
 			return nil, nil // replayed stored command: already posted
 		}
-		markSeen(id)
+		s.st.markSeen(id)
 	}
 
 	p := RoomPost{
-		Seq:        state.NextSeq,
+		Seq:        s.st.NextSeq,
 		CreatedAt:  time.Now(),
 		AuthorKey:  keyHex,
 		AuthorName: c.SenderName,
 		Text:       text,
 	}
-	state.NextSeq++
-	state.Posts = append(state.Posts, p)
-	u := user(keyHex, c.SenderName)
+	s.st.NextSeq++
+	s.st.Posts = append(s.st.Posts, p)
+	u := s.st.user(keyHex, c.SenderName)
 	// The cursor is deliberately NOT advanced past the author's own post:
 	// posts they missed between their cursor and here must stay unread (their
 	// own post is skipped when they next run get).
-	if err := roomSave(); err != nil {
+	if err := s.save(); err != nil {
 		return []string{tr.T(c.Lang, "err.save")}, err
 	}
-	pushPost(c.Lang, p)
-	return []string{tr.T(c.Lang, "sent", p.Seq, unread(u))}, nil
+	pushPost(c.Lang, room, s, p)
+	if room != defaultRoom() {
+		return []string{tr.T(c.Lang, "sent.in", p.Seq, room, s.st.unread(u))}, nil
+	}
+	return []string{tr.T(c.Lang, "sent", p.Seq, s.st.unread(u))}, nil
 }
 
 // roomGet returns up to n unread posts (oldest first), advancing the user's
 // cursor by what was rendered.
-func roomGet(lang, keyHex, name, rest string) ([]string, error) {
-	n := batchArg(rest, getBatch())
+func roomGet(lang, room, keyHex, name, args string) ([]string, error) {
+	n := batchArg(args, getBatch())
 
 	roomMu.Lock()
 	defer roomMu.Unlock()
-	if err := roomLoad(); err != nil {
+	s, err := loadStore(room)
+	if err != nil {
 		return []string{tr.T(lang, "err.load")}, err
 	}
-	u := user(keyHex, name)
+	u := s.st.user(keyHex, name)
 
 	var msgs []string
-	for _, p := range state.Posts {
+	for _, p := range s.st.Posts {
 		if len(msgs) >= n {
 			break
 		}
@@ -159,66 +206,69 @@ func roomGet(lang, keyHex, name, rest string) ([]string, error) {
 	if len(msgs) == 0 {
 		return []string{tr.T(lang, "get.none")}, nil
 	}
-	if remaining := unread(u); remaining > 0 {
+	if remaining := s.st.unread(u); remaining > 0 {
 		msgs = append(msgs, tr.T(lang, "get.more", remaining))
 	}
-	if err := roomSave(); err != nil {
+	if err := s.save(); err != nil {
 		return msgs, err // posts are delivered; the cursor save failure is logged upstream
 	}
 	return msgs, nil
 }
 
-// roomSetSub toggles subscription and reports the pending unread count.
-func roomSetSub(lang, keyHex, name string, on bool) []string {
+// roomSetSub toggles subscription in one room and reports pending unread.
+func roomSetSub(lang, room, keyHex, name string, on bool) ([]string, error) {
 	roomMu.Lock()
 	defer roomMu.Unlock()
-	if err := roomLoad(); err != nil {
-		return []string{tr.T(lang, "err.load")}
+	s, err := loadStore(room)
+	if err != nil {
+		return []string{tr.T(lang, "err.load")}, err
 	}
-	u := user(keyHex, name)
+	u := s.st.user(keyHex, name)
 	u.Subscribed = on
-	if err := roomSave(); err != nil {
-		return []string{tr.T(lang, "err.save")}
+	if err := s.save(); err != nil {
+		return []string{tr.T(lang, "err.save")}, err
 	}
 	if on {
-		return []string{tr.T(lang, "sub.on", unread(u))}
+		return []string{tr.T(lang, "sub.on", s.st.unread(u))}, nil
 	}
-	return []string{tr.T(lang, "sub.off")}
+	return []string{tr.T(lang, "sub.off")}, nil
 }
 
 // roomStatus reports subscription, unread count and the last post preview.
-func roomStatus(lang, keyHex, name string) []string {
+func roomStatus(lang, room, keyHex, name string) ([]string, error) {
 	roomMu.Lock()
 	defer roomMu.Unlock()
-	if err := roomLoad(); err != nil {
-		return []string{tr.T(lang, "err.load")}
+	s, err := loadStore(room)
+	if err != nil {
+		return []string{tr.T(lang, "err.load")}, err
 	}
-	u := user(keyHex, name)
-	if len(state.Posts) == 0 {
-		return []string{tr.T(lang, "empty")}
+	u := s.st.user(keyHex, name)
+	if len(s.st.Posts) == 0 {
+		return []string{tr.T(lang, "empty")}, nil
 	}
-	last := state.Posts[len(state.Posts)-1]
-	lines := []string{tr.T(lang, "status", subLabel(lang, u.Subscribed), unread(u), len(state.Posts))}
+	last := s.st.Posts[len(s.st.Posts)-1]
+	lines := []string{tr.T(lang, "status", room, subLabel(lang, u.Subscribed), s.st.unread(u), len(s.st.Posts))}
 	lines = append(lines, renderPost(lang, last))
-	return lines
+	return lines, nil
 }
 
 // roomLast renders the last n posts regardless of cursors — history browsing.
-func roomLast(lang, rest string) ([]string, error) {
-	n := batchArg(rest, getBatch())
+func roomLast(lang, room, args string) ([]string, error) {
+	n := batchArg(args, getBatch())
 
 	roomMu.Lock()
 	defer roomMu.Unlock()
-	if err := roomLoad(); err != nil {
+	s, err := loadStore(room)
+	if err != nil {
 		return []string{tr.T(lang, "err.load")}, err
 	}
-	if len(state.Posts) == 0 {
+	if len(s.st.Posts) == 0 {
 		return []string{tr.T(lang, "empty")}, nil
 	}
-	if n > len(state.Posts) {
-		n = len(state.Posts)
+	if n > len(s.st.Posts) {
+		n = len(s.st.Posts)
 	}
-	tail := state.Posts[len(state.Posts)-n:]
+	tail := s.st.Posts[len(s.st.Posts)-n:]
 	msgs := make([]string, 0, len(tail))
 	for _, p := range tail {
 		msgs = append(msgs, renderPost(lang, p))
@@ -226,24 +276,25 @@ func roomLast(lang, rest string) ([]string, error) {
 	return msgs, nil
 }
 
-// roomWho lists the participants, subscribers first.
-func roomWho(lang string) []string {
+// roomWho lists the room's participants, subscribers first.
+func roomWho(lang, room string) ([]string, error) {
 	roomMu.Lock()
 	defer roomMu.Unlock()
-	if err := roomLoad(); err != nil {
-		return []string{tr.T(lang, "err.load")}
+	s, err := loadStore(room)
+	if err != nil {
+		return []string{tr.T(lang, "err.load")}, err
 	}
-	if len(state.Users) == 0 {
-		return []string{tr.T(lang, "who.none")}
+	if len(s.st.Users) == 0 {
+		return []string{tr.T(lang, "who.none")}, nil
 	}
-	keys := make([]string, 0, len(state.Users))
-	for k := range state.Users {
+	keys := make([]string, 0, len(s.st.Users))
+	for k := range s.st.Users {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	var subs, others []string
 	for _, k := range keys {
-		u := state.Users[k]
+		u := s.st.Users[k]
 		label := u.Name
 		if label == "" {
 			label = helpers.ClipRunes(u.Key, 6)
@@ -254,20 +305,46 @@ func roomWho(lang string) []string {
 			others = append(others, label)
 		}
 	}
-	if len(subs)+len(others) == 0 {
-		return []string{tr.T(lang, "who.none")}
-	}
 	if len(subs) == 0 {
-		return []string{tr.T(lang, "who.no_subs", len(others), strings.Join(others, ", "))}
+		return []string{tr.T(lang, "who.no_subs", len(others), strings.Join(others, ", "))}, nil
 	}
-	return []string{tr.T(lang, "who", len(subs), strings.Join(subs, ", "), len(others), strings.Join(others, ", "))}
+	return []string{tr.T(lang, "who", len(subs), strings.Join(subs, ", "), len(others), strings.Join(others, ", "))}, nil
+}
+
+// roomList shows every declared room with the caller's subscription state and
+// unread count. Listing never enrolls the caller in a room they haven't used.
+func roomList(lang, keyHex string) ([]string, error) {
+	roomMu.Lock()
+	defer roomMu.Unlock()
+
+	lines := make([]string, 0, len(conf.Rooms)+1)
+	lines = append(lines, tr.T(lang, "list.header"))
+	for _, name := range roomNames() {
+		state := tr.T(lang, "sub.off_short")
+		unreadN := 0
+		if s, err := loadStore(name); err == nil {
+			if u, ok := s.st.Users[keyHex]; ok {
+				if u.Subscribed {
+					state = tr.T(lang, "sub.on_short")
+				}
+				unreadN = s.st.unread(u)
+			} else {
+				// Never touched the room: every post so far is unseen.
+				unreadN = s.st.NextSeq - 1
+			}
+		} else {
+			return []string{tr.T(lang, "err.load")}, err
+		}
+		lines = append(lines, tr.T(lang, "list.line", name, state, unreadN))
+	}
+	return lines, nil
 }
 
 // batchArg parses an optional "[n]" argument: the first integer field wins,
 // garbage or absence falls back to def.
-func batchArg(rest string, def int) int {
-	if fields := strings.Fields(rest); len(fields) >= 2 {
-		if v, err := strconv.Atoi(fields[1]); err == nil && v > 0 {
+func batchArg(args string, def int) int {
+	if fields := strings.Fields(args); len(fields) >= 1 {
+		if v, err := strconv.Atoi(fields[0]); err == nil && v > 0 {
 			def = v
 		}
 	}

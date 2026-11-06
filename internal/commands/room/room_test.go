@@ -47,16 +47,21 @@ type push struct {
 	text string
 }
 
-// testEnv redirects the store to a temp dir, resets config, and captures
-// pushed DMs; it returns a push-sink factory to install per test.
+// testEnv redirects the store dir to a temp dir, resets the config to the
+// normalized implicit single room ("main"), and captures pushed DMs; it
+// returns a push-sink reader to install per test.
 func testEnv(t *testing.T) func() []push {
 	t.Helper()
 	dir := t.TempDir()
-	oldDir, oldFile, oldLoaded, oldState := roomDir, roomFile, roomLoaded, state
+	oldDir, oldStores := roomDir, stores
 	conf0 := conf
-	roomDir, roomFile, roomLoaded, state = dir, filepath.Join(dir, "room.json"), false, nil
+	roomDir, stores = dir, map[string]*store{}
+	conf = cfg{}
+	if err := normalize(&conf); err != nil {
+		t.Fatalf("normalize zero config: %v", err)
+	}
 	t.Cleanup(func() {
-		roomDir, roomFile, roomLoaded, state = oldDir, oldFile, oldLoaded, oldState
+		roomDir, stores = oldDir, oldStores
 		conf = conf0
 	})
 
@@ -70,6 +75,16 @@ func testEnv(t *testing.T) func() []push {
 	}
 	t.Cleanup(func() { lookupContact, sendDM = oldLookup, oldSend })
 	return func() []push { return pushes }
+}
+
+// setConf mutates the test config in place and re-runs the validation the
+// startup Configure path applies.
+func setConf(t *testing.T, mutate func(*cfg)) {
+	t.Helper()
+	mutate(&conf)
+	if err := normalize(&conf); err != nil {
+		t.Fatalf("normalize config: %v", err)
+	}
 }
 
 // dmCtx builds the Ctx registry.Dispatch would hand Handle for a DM, with Rest
@@ -109,8 +124,123 @@ func TestSendPushesToSubscribersOnly(t *testing.T) {
 	if !strings.Contains(got[0].text, "alice") || !strings.Contains(got[0].text, "hello room") {
 		t.Fatalf("pushed text = %q, want author + post text", got[0].text)
 	}
+	if strings.Contains(got[0].text, "[") {
+		t.Fatalf("default-room push = %q, want no room prefix", got[0].text)
+	}
 	if got[0].raw != rawKeyOf(keyOf(bobKey)) {
 		t.Fatalf("pushed raw key = %q, want bob's raw key", got[0].raw)
+	}
+}
+
+func TestMultiRoomIsolationAndPushPrefix(t *testing.T) {
+	sink := testEnv(t)
+	setConf(t, func(c *cfg) { c.Rooms = append(c.Rooms, roomDecl{Name: "secret"}) })
+
+	// bob subscribes in the non-default room only: main unread accumulates,
+	// secret posts are pushed with the room prefix.
+	send(t, ".room secret on", bobKey, "bob", time.Unix(1000, 0))
+	send(t, ".room send main post", aliceKey, "alice", time.Unix(1001, 0))
+	send(t, ".room secret send secret post", aliceKey, "alice", time.Unix(1002, 0))
+
+	got := sink()
+	if len(got) != 1 {
+		t.Fatalf("pushes = %v, want exactly one (secret to bob)", got)
+	}
+	if !strings.HasPrefix(got[0].text, "[secret] ") {
+		t.Fatalf("non-default push = %q, want [secret] prefix", got[0].text)
+	}
+	if !strings.Contains(got[0].text, "secret post") {
+		t.Fatalf("non-default push = %q, want the post text", got[0].text)
+	}
+
+	// get is room-scoped: main still unread, secret consumed by the push.
+	replies := send(t, ".room get", bobKey, "bob", time.Unix(1003, 0))
+	if len(replies) != 1 || !strings.Contains(replies[0], "main post") {
+		t.Fatalf("main get = %v, want the main post", replies)
+	}
+	replies = send(t, ".room secret get", bobKey, "bob", time.Unix(1004, 0))
+	if len(replies) != 1 || !strings.Contains(replies[0], "No unread") {
+		t.Fatalf("secret get = %v, want consumed by push", replies)
+	}
+
+	// who is room-scoped: bob fetched main once (enrolled) but never
+	// subscribed there, while secret shows him listening.
+	replies = send(t, ".room who", aliceKey, "alice", time.Unix(1005, 0))
+	if len(replies) != 1 || !strings.Contains(replies[0], "none listening") {
+		t.Fatalf("main who = %v, want bob present but not listening", replies)
+	}
+	replies = send(t, ".room secret who", aliceKey, "alice", time.Unix(1006, 0))
+	if len(replies) != 1 || !strings.Contains(replies[0], "bob") {
+		t.Fatalf("secret who = %v, want bob listening", replies)
+	}
+
+	// per-room store files on disk.
+	for _, name := range []string{"main", "secret"} {
+		if _, err := os.Stat(roomPath(name)); err != nil {
+			t.Fatalf("store file %s missing: %v", name, err)
+		}
+	}
+}
+
+func TestRoomNameVsVerb(t *testing.T) {
+	testEnv(t)
+	setConf(t, func(c *cfg) { c.Rooms = append(c.Rooms, roomDecl{Name: "secret"}) })
+
+	// verbs still own the first token: this posts to the default room.
+	replies := send(t, ".room send first", aliceKey, "alice", time.Unix(2000, 0))
+	if len(replies) != 1 || !strings.Contains(replies[0], "#1") {
+		t.Fatalf("verb-first routing = %v", replies)
+	}
+
+	// bare room name = status of THAT room: secret is empty while main has
+	// the post above, so the empty-room invite proves the routing.
+	replies = send(t, ".room secret", aliceKey, "alice", time.Unix(2001, 0))
+	if len(replies) != 1 || !strings.Contains(replies[0], "empty") {
+		t.Fatalf("room status = %v, want secret's empty invite", replies)
+	}
+
+	// confirmed send into a named room names it.
+	replies = send(t, ".room secret send hello", aliceKey, "alice", time.Unix(2002, 0))
+	if len(replies) != 1 || !strings.Contains(replies[0], "in secret") {
+		t.Fatalf("named send = %v, want 'in secret' confirmation", replies)
+	}
+
+	// undeclared but valid name → explicit hint.
+	replies = send(t, ".room lounge send hi", aliceKey, "alice", time.Unix(2003, 0))
+	if len(replies) != 1 || !strings.Contains(replies[0], "No such room") {
+		t.Fatalf("undeclared room = %v, want no-such-room", replies)
+	}
+
+	// garbage token → the generic unknown reply.
+	replies = send(t, ".room !! send hi", aliceKey, "alice", time.Unix(2004, 0))
+	if len(replies) != 1 || !strings.Contains(replies[0], "Unknown") {
+		t.Fatalf("garbage token = %v, want unknown", replies)
+	}
+
+	// room lookup is case-insensitive.
+	replies = send(t, ".room SECRET on", bobKey, "bob", time.Unix(2005, 0))
+	if len(replies) != 1 || !strings.Contains(replies[0], "Subscribed") {
+		t.Fatalf("uppercase room = %v, want subscribed", replies)
+	}
+}
+
+func TestList(t *testing.T) {
+	testEnv(t)
+	setConf(t, func(c *cfg) { c.Rooms = append(c.Rooms, roomDecl{Name: "secret"}) })
+
+	send(t, ".room send m1", aliceKey, "alice", time.Unix(3000, 0))
+	send(t, ".room secret on", bobKey, "bob", time.Unix(3001, 0))
+	send(t, ".room secret send s1", aliceKey, "alice", time.Unix(3002, 0))
+
+	replies := send(t, ".room list", bobKey, "bob", time.Unix(3003, 0))
+	if len(replies) != 3 {
+		t.Fatalf("list = %v, want header + two rooms", replies)
+	}
+	if !strings.Contains(replies[1], "main") || !strings.Contains(replies[1], "1") {
+		t.Fatalf("main line = %q, want one unread", replies[1])
+	}
+	if !strings.Contains(replies[2], "secret") || !strings.Contains(replies[2], "on") {
+		t.Fatalf("secret line = %q, want subscribed", replies[2])
 	}
 }
 
@@ -221,9 +351,11 @@ func TestGates(t *testing.T) {
 	if len(replies) != 1 || !strings.Contains(replies[0], "advert") {
 		t.Fatalf("empty key = %v, want need-key", replies)
 	}
-	replies = send(t, ".room bogus", aliceKey, "alice", time.Unix(6001, 0))
-	if len(replies) != 1 || !strings.Contains(replies[0], "Unknown") {
-		t.Fatalf("unknown verb = %v", replies)
+	// "bogus" has a valid room-name shape → the specific no-such-room hint
+	// (the generic Unknown reply is covered by TestRoomNameVsVerb).
+	replies = send(t, ".room bogus verb", aliceKey, "alice", time.Unix(6001, 0))
+	if len(replies) != 1 || !strings.Contains(replies[0], "No such room") {
+		t.Fatalf("undeclared room = %v", replies)
 	}
 	replies = send(t, ".room send", aliceKey, "alice", time.Unix(6002, 0))
 	if len(replies) != 1 || !strings.Contains(replies[0], "Usage") {
@@ -233,8 +365,9 @@ func TestGates(t *testing.T) {
 
 func TestClosedRoomSilentToNonMembers(t *testing.T) {
 	testEnv(t)
-	conf.Closed = true
-	conf.Allow = []string{"aa01"}
+	setConf(t, func(c *cfg) {
+		c.Rooms = []roomDecl{{Name: "main", Closed: true, Allow: []string{"aa01"}}}
+	})
 
 	replies := send(t, ".room send hi", aliceKey, "alice", time.Unix(7000, 0))
 	if len(replies) != 1 || !strings.Contains(replies[0], "#1") {
@@ -264,47 +397,64 @@ func TestReplayGuard(t *testing.T) {
 	}
 }
 
+func TestReplayGuardPerRoom(t *testing.T) {
+	testEnv(t)
+	setConf(t, func(c *cfg) { c.Rooms = append(c.Rooms, roomDecl{Name: "secret"}) })
+	ts := time.Unix(8100, 0)
+
+	send(t, ".room send once", aliceKey, "alice", ts)
+	replay := send(t, ".room send once", aliceKey, "alice", ts)
+	if replay != nil {
+		t.Fatalf("replayed default-room send = %v, want silent skip", replay)
+	}
+	// The same sender+timestamp in another room is a different command and
+	// must post normally.
+	replies := send(t, ".room secret send once", aliceKey, "alice", ts)
+	if len(replies) != 1 || !strings.Contains(replies[0], "#1") {
+		t.Fatalf("same id in another room = %v, want posted #1", replies)
+	}
+}
+
 func TestPruneAndReload(t *testing.T) {
 	testEnv(t)
-	conf.MaxPosts = 3
+	setConf(t, func(c *cfg) { c.MaxPosts = 3 })
 
 	for i, ts := range []int64{9001, 9002, 9003, 9004, 9005} {
 		send(t, ".room send p"+string(rune('a'+i)), aliceKey, "alice", time.Unix(ts, 0))
 	}
 
 	roomMu.Lock()
-	err := roomLoad()
+	s, err := loadStore(defaultRoom())
 	roomMu.Unlock()
 	if err != nil {
 		t.Fatalf("reload: %v", err)
 	}
-	if len(state.Posts) != 3 || state.Posts[0].Text != "pc" || state.NextSeq != 6 {
+	if len(s.st.Posts) != 3 || s.st.Posts[0].Text != "pc" || s.st.NextSeq != 6 {
 		t.Fatalf("store after prune/reload = %d posts, oldest %q, next %d",
-			len(state.Posts), state.Posts[0].Text, state.NextSeq)
+			len(s.st.Posts), s.st.Posts[0].Text, s.st.NextSeq)
 	}
 }
 
 func TestBakRecovery(t *testing.T) {
 	testEnv(t)
 
-	// Two saves: roomSave keeps the PREVIOUS generation as .bak, so after two
+	// Two saves: save keeps the PREVIOUS generation as .bak, so after two
 	// posts the .bak holds "one" while the main file holds "one"+"two".
 	send(t, ".room send one", aliceKey, "alice", time.Unix(9500, 0))
 	send(t, ".room send two", aliceKey, "alice", time.Unix(9501, 0))
-	if err := os.WriteFile(roomFile, []byte("{corrupt"), 0o644); err != nil {
+	if err := os.WriteFile(roomPath(defaultRoom()), []byte("{corrupt"), 0o644); err != nil {
 		t.Fatalf("corrupt main file: %v", err)
 	}
 
 	roomMu.Lock()
-	roomLoaded = false
-	state = nil
-	err := roomLoad()
+	delete(stores, defaultRoom())
+	s, err := loadStore(defaultRoom())
 	roomMu.Unlock()
 	if err != nil {
 		t.Fatalf("load after corrupt: %v", err)
 	}
-	if len(state.Posts) != 1 || state.Posts[0].Text != "one" {
-		t.Fatalf("recovered posts = %+v, want .bak generation", state.Posts)
+	if len(s.st.Posts) != 1 || s.st.Posts[0].Text != "one" {
+		t.Fatalf("recovered posts = %+v, want .bak generation", s.st.Posts)
 	}
 }
 
@@ -314,7 +464,7 @@ func TestRoundTripJSON(t *testing.T) {
 	send(t, ".room on", bobKey, "bob", time.Unix(9700, 0))
 	send(t, ".room send hi", aliceKey, "alice", time.Unix(9701, 0))
 
-	data, err := os.ReadFile(roomFile)
+	data, err := os.ReadFile(roomPath(defaultRoom()))
 	if err != nil {
 		t.Fatalf("read store: %v", err)
 	}
@@ -330,18 +480,57 @@ func TestRoundTripJSON(t *testing.T) {
 
 func TestBatchArgCapsAndDefaults(t *testing.T) {
 	testEnv(t)
-	if got := batchArg("get", getBatch()); got != getBatch() {
-		t.Fatalf("batchArg(get) = %d, want default", got)
+	if got := batchArg("", getBatch()); got != getBatch() {
+		t.Fatalf("batchArg(empty) = %d, want default", got)
 	}
-	if got := batchArg("get 5", getBatch()); got != 5 {
-		t.Fatalf("batchArg(get 5) = %d, want 5", got)
+	if got := batchArg("5", getBatch()); got != 5 {
+		t.Fatalf("batchArg(5) = %d, want 5", got)
 	}
-	if got := batchArg("get bogus", getBatch()); got != getBatch() {
+	if got := batchArg("bogus", getBatch()); got != getBatch() {
 		t.Fatalf("batchArg(garbage) = %d, want default", got)
 	}
 	conf.MaxBatch = 7
-	if got := batchArg("get 99", 99); got != 7 {
+	if got := batchArg("99", 99); got != 7 {
 		t.Fatalf("batchArg over cap = %d, want capped to 7", got)
+	}
+}
+
+func TestNormalize(t *testing.T) {
+	// reserved word can never be a room name
+	err := normalize(&cfg{Rooms: []roomDecl{{Name: "send"}}})
+	if err == nil || !strings.Contains(err.Error(), "command word") {
+		t.Fatalf("reserved name error = %v", err)
+	}
+	// duplicates rejected
+	err = normalize(&cfg{Rooms: []roomDecl{{Name: "a"}, {Name: "a"}}})
+	if err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("duplicate error = %v", err)
+	}
+	// closed needs allow keys
+	err = normalize(&cfg{Rooms: []roomDecl{{Name: "a", Closed: true}}})
+	if err == nil || !strings.Contains(err.Error(), "allow") {
+		t.Fatalf("closed-without-allow error = %v", err)
+	}
+	// charset/length guard
+	err = normalize(&cfg{Rooms: []roomDecl{{Name: "has space"}}})
+	if err == nil || !strings.Contains(err.Error(), "must match") {
+		t.Fatalf("bad charset error = %v", err)
+	}
+	// implicit default room appended, names normalized
+	c := &cfg{Rooms: []roomDecl{{Name: " Secret "}}}
+	if err := normalize(c); err != nil {
+		t.Fatalf("normalize good config: %v", err)
+	}
+	if c.Default != "main" || len(c.Rooms) != 2 || c.Rooms[0].Name != "secret" || c.Rooms[1].Name != "main" {
+		t.Fatalf("normalized config = default %q, rooms %+v", c.Default, c.Rooms)
+	}
+	// unlisted default appended too
+	c = &cfg{Default: "lounge"}
+	if err := normalize(c); err != nil {
+		t.Fatalf("normalize lounge config: %v", err)
+	}
+	if len(c.Rooms) != 1 || c.Rooms[0].Name != "lounge" {
+		t.Fatalf("lounge config rooms = %+v", c.Rooms)
 	}
 }
 
