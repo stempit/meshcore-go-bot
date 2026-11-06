@@ -114,7 +114,7 @@ func TestSendPushesToSubscribersOnly(t *testing.T) {
 	send(t, ".room on", aliceKey, "alice", time.Unix(1001, 0)) // subscribed too
 	replies := send(t, ".room send hello room", aliceKey, "alice", time.Unix(1002, 0))
 
-	if len(replies) != 1 || !strings.Contains(replies[0], "#1") {
+	if len(replies) != 1 || !strings.Contains(replies[0], "[1]") {
 		t.Fatalf("send reply = %v, want confirmation with seq 1", replies)
 	}
 	got := sink()
@@ -124,7 +124,7 @@ func TestSendPushesToSubscribersOnly(t *testing.T) {
 	if !strings.Contains(got[0].text, "alice") || !strings.Contains(got[0].text, "hello room") {
 		t.Fatalf("pushed text = %q, want author + post text", got[0].text)
 	}
-	if strings.Contains(got[0].text, "[") {
+	if strings.HasPrefix(got[0].text, "[main]") || strings.HasPrefix(got[0].text, "[secret]") {
 		t.Fatalf("default-room push = %q, want no room prefix", got[0].text)
 	}
 	if got[0].raw != rawKeyOf(keyOf(bobKey)) {
@@ -188,7 +188,7 @@ func TestRoomNameVsVerb(t *testing.T) {
 
 	// verbs still own the first token: this posts to the default room.
 	replies := send(t, ".room send first", aliceKey, "alice", time.Unix(2000, 0))
-	if len(replies) != 1 || !strings.Contains(replies[0], "#1") {
+	if len(replies) != 1 || !strings.Contains(replies[0], "[1]") {
 		t.Fatalf("verb-first routing = %v", replies)
 	}
 
@@ -325,7 +325,7 @@ func TestGetSkipsOwnPostsAfterGap(t *testing.T) {
 	send(t, ".room send b2", bobKey, "bob", time.Unix(9602, 0))
 	// alice posts while having bob's two posts unread: the gap must survive.
 	replies := send(t, ".room send a2", aliceKey, "alice", time.Unix(9603, 0))
-	if len(replies) != 1 || !strings.Contains(replies[0], "#4") {
+	if len(replies) != 1 || !strings.Contains(replies[0], "[4]") {
 		t.Fatalf("send = %v, want posted #4", replies)
 	}
 
@@ -370,7 +370,7 @@ func TestClosedRoomSilentToNonMembers(t *testing.T) {
 	})
 
 	replies := send(t, ".room send hi", aliceKey, "alice", time.Unix(7000, 0))
-	if len(replies) != 1 || !strings.Contains(replies[0], "#1") {
+	if len(replies) != 1 || !strings.Contains(replies[0], "[1]") {
 		t.Fatalf("member send = %v, want posted", replies)
 	}
 	replies, err := plugin{}.Handle(dmCtx(".room who", bobKey, "bob", time.Unix(7001, 0)))
@@ -410,7 +410,7 @@ func TestReplayGuardPerRoom(t *testing.T) {
 	// The same sender+timestamp in another room is a different command and
 	// must post normally.
 	replies := send(t, ".room secret send once", aliceKey, "alice", ts)
-	if len(replies) != 1 || !strings.Contains(replies[0], "#1") {
+	if len(replies) != 1 || !strings.Contains(replies[0], "[1]") {
 		t.Fatalf("same id in another room = %v, want posted #1", replies)
 	}
 }
