@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/stempit/meshcore-go-bot/internal/config"
+	"github.com/stempit/meshcore-go-bot/internal/shrink"
 )
 
 // MatchMode selects how a command's Triggers are compared against Ctx.Lower.
@@ -156,8 +157,10 @@ func restAfterTrigger(ctx Ctx, trigger string) string {
 func Dispatch(ctx Ctx) (replies []string, name string, err error) {
 	// Per-command help: "<trigger> help" returns that command's HelpLong. Runs
 	// before the dispatch loop so it wins over the agent/bbs Matcher interceptors.
-	if h, n, ok := helpReply(ctx); ok {
-		return []string{h}, n, nil
+	// The shrink name is shrink.HelpName, not the command's: help text must
+	// always split, never take the command's (possibly LLM) variant.
+	if h, _, ok := helpReply(ctx); ok {
+		return []string{h}, shrink.HelpName, nil
 	}
 	for _, c := range dispatchOrder() {
 		if !enabled(c) {

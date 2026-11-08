@@ -16,6 +16,7 @@ import (
 	"github.com/stempit/meshcore-go-bot/internal/bridge/mqttbridge"
 	"github.com/stempit/meshcore-go-bot/internal/bridge/tgbridge"
 	_ "github.com/stempit/meshcore-go-bot/internal/commands/allcommands" // self-registering command plugins
+	"github.com/stempit/meshcore-go-bot/internal/commands/room"
 	"github.com/stempit/meshcore-go-bot/internal/commands/ticket"
 	"github.com/stempit/meshcore-go-bot/internal/config"
 	"github.com/stempit/meshcore-go-bot/internal/dispatch"
@@ -149,6 +150,17 @@ func main() {
 	// The .words game pushes round results from a timer goroutine; give the games
 	// package a way to resolve a scope back to a channel/contact and enqueue.
 	games.SetAnnouncer(d.AnnounceToScope)
+
+	// The .room service pushes new posts to subscribers as DMs; inject the
+	// contact lookup and the dispatcher's DM sender the same way.
+	room.SetDelivery(
+		func(rawKey string) *meshcore.Contact {
+			if rawKey == "" { // undecodable store key: an empty prefix matches every contact
+				return nil
+			}
+			return client.FindContactByKeyPrefix([]byte(rawKey)[:min(6, len(rawKey))])
+		},
+		d.SendDirectMessage)
 
 	// ─── Greet new nodes + hash migration nudge ───────────────────────────────
 
@@ -300,9 +312,31 @@ drainLoop:
 	// ─── Live message forwarder goroutine ─────────────────────────────────────
 	// All messages from here on are new live arrivals.
 
+	// The driver recreates incomingCh on every reconnect (startWith) but leaves
+	// the old one open (markDisconnected), so a plain `range` parks forever on
+	// the stale channel after the first reconnect and the pipeline silently
+	// stalls. Re-acquire the channel on every tick: a stale channel is swapped
+	// for the new one within one tick, and a closed one (a reconnect whose
+	// handshake failed makes the driver Disconnect) nils out — a nil channel
+	// never fires in a select — until the next tick picks up the replacement.
+	// Messages arriving in between buffer in the driver's incomingCh.
 	go func() {
-		for msg := range client.IncomingMessages() {
-			d.Submit(msg)
+		tick := time.NewTicker(10 * time.Second)
+		defer tick.Stop()
+		ch := client.IncomingMessages()
+		for {
+			select {
+			case msg, ok := <-ch:
+				if !ok {
+					ch = nil
+					continue
+				}
+				d.Submit(msg)
+			case <-tick.C:
+				ch = client.IncomingMessages()
+			case <-ctx.Done():
+				return
+			}
 		}
 	}()
 

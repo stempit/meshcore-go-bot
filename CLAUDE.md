@@ -111,6 +111,8 @@ log/
   known.txt               – greeted node public keys (hex, one per line)
   news/<feed>.txt         – RSS items written by the separate newswire app (https://github.com/Stempit/newswire); read by .news
   alerts/<name>.txt       – ids of alert items already seen/announced, one file per configured source
+  room/<name>.json        – .room state: posts, cursors, replay-guard ring (one file per room, +.bak)
+  2ch/threads.json        – .2ch BBS threads (+.bak)
 ```
 
 ## Packages that need care
@@ -145,6 +147,7 @@ Each command is a self-registering plugin in its own folder; the table's **Plugi
 | `.words [start/<слово>/status/end/top]` | `commands/words` → `words` | Anagram ("Слова из слова"): timed round, build words from one long base word's letters; `score = len²`. Opt-in (`words.enabled`), embedded dict (`words_anagram_ru.txt` for `Language: ru`, `words_en.txt` otherwise). Self-firing timer pushes results via the injected `games.Announcer`. Channels collaborative-competitive, DMs solo; `.words top` is a 30-day leaderboard. See [internal/commands/words/README.md](internal/commands/words/README.md) |
 | `.vote [start <q> \| a \| b / <n> / status / end]` | `commands/vote` → `vote` | Group poll: open with a question and pipe-separated options, one changeable anonymous vote per sender (keyed by `SenderKey`), numbered results. Channels only. Opt-in (`vote.enabled`); auto-closes after `vote.round_sec` (default 180s), pushing results via the injected `games.Announcer`, or via `.vote end`. No leaderboard |
 | `.poker [start/join/leave/end/top]` | `commands/poker` → `poker` | Fixed-limit Hold'em on a channel (2–6): the channel gets dealer commentary only, betting actions go via DM (`Matcher` intercept for seated players; priced dynamic turn prompts). Opt-in (`poker.enabled`); blinds 5/10, 90s turn timeout (auto check/fold), 20s deal pause, 15-min idle close, `.poker end` opener-only. `.poker top` is a 30-day leaderboard. See [internal/commands/poker/README.md](internal/commands/poker/README.md) |
+| `.room [status/get/send/on/off/last/who/list]` | `commands/room` → `room` | Room-server analog on DMs: post (`send`), read history (`get`/`last`), subscribe to new-post DM pushes (`on`/`off`); per-user unread cursors, per-room history in `log/room/<name>.json` (atomic save + `.bak`). Multi-room: first token after the trigger selects the room unless it's a verb (`.room secret send hi`); non-default pushes carry a `[name] ` prefix; `closed`+`allow` restrict per room by key prefix; rooms declared in `room.rooms` (default room auto-added). DMs only; pushes fan out via the injected `room.SetDelivery` lookup+sender wired in `cmd/bot`. Opt-in (`room.enabled`) |
 
 New commands are self-registering plugins: create `internal/commands/<name>/` implementing `registry.Command` (+ `Configurable`/`Matcher` if needed) and add one blank import to `internal/commands/allcommands`. There is no central switch or help list to edit — `.help` and routing are generated from each plugin's `Meta`. See [docs/NEW_COMMAND.md](docs/NEW_COMMAND.md) and the framework in [internal/support/registry/README.md](internal/support/registry/README.md).
 
