@@ -4,7 +4,7 @@ go 1.27.1
 
 require (
 	filippo.io/edwards25519 v1.2.0
-	github.com/OvyFlash/telegram-bot-api v0.0.0-20260826195316-83c4eada97a1
+	github.com/OvyFlash/telegram-bot-api v0.0.0-20261109145030-db575b9b8ee0
 	github.com/eclipse/paho.mqtt.golang v1.5.1
 	github.com/gorilla/websocket v1.5.3
 	github.com/ollama/ollama v0.40.11
