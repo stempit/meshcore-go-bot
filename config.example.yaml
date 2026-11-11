@@ -193,6 +193,18 @@ Migration:
   message: "switch to 2-byte please"
   cooldown_sec: 86400  # min gap between warnings to the same node; 0 = default 24h
 
+Advert:
+  # Periodic advert beacon: makes the device emit its own advert so the node
+  # stays visible in the mesh. The advertised identity is whatever the device
+  # already has stored (set it via the MeshCore app), not from this config.
+  # The first send happens after one full period, not at startup. Flood adverts
+  # propagate mesh-wide (every repeater rebroadcasts), direct adverts are heard
+  # by direct neighbors only — keep the flood period generous. Minimums:
+  # flood >= 1 hour, direct >= 1 minute; a 0 period turns that mode off.
+  enabled: false
+  flood_interval_hours: 6   # flood advert period, hours; 0 = off
+  direct_interval_min: 30   # direct advert period, minutes; 0 = off
+
 Top:
   # ".top" ranks the most active authors in the channel where it was called.
   # scan_count is how many of the most recent (non-bot) channel messages are

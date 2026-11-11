@@ -46,6 +46,10 @@ internal/
     helpers/            – small cross-command utilities (ClipRunes, HistoryDir)
     historylog/         – per-conversation append-only log files
   greeter/              – greets newly seen nodes; owns KnownKeys persistence + GreetMessage
+  beacon/               – periodic advert beacon: makes the device emit flood (hours) / direct
+                          (minutes) self-adverts on configurable periods (Advert config section);
+                          first send after one full period, no startup advert; skips while the
+                          device is disconnected
   config/               – YAML config loader (singleton via sync.Once) + per-plugin Sectioner
   shrink/               – config policy layer over the fit package (meshcore-kit):
                           variant resolution per send path + the LLM compressor
@@ -89,6 +93,8 @@ Key environment variables:
 **Channel redirect:** the `Redirect` section steers flood-prone commands off busy channels — when a rule's command arrives on a listed channel, the bot replies with the rule's notice instead of running the command (DMs exempt). The gate lives in `registry.Dispatch` (before the handler runs, so no state mutates) with a per-channel cooldown on the notice itself. Rules match by canonical command name (`Meta().Name`).
 
 **Hazard alerts:** the `Alerts` section configures `internal/bridge/alerts` with a list of independent `sources`, each opt-in via its own `enabled` flag (default false) and with its own `type` (`html_cards` for bplarussia.ru-style incident pages, `rss` for standard RSS feeds), `url`, target `channel` (must already exist on the MeshCore device), `poll_interval_sec`, and `max_per_poll`. An optional `title_prefix` filters an RSS/HTML source down to items whose title starts with it — e.g. the shipped `mchs` source uses `title_prefix: "Внимание"` to keep only genuine МЧС hazard warnings and skip routine daily reports. An optional `postfix` is appended as-is to the announced message text (include your own separator, e.g. `" #БПЛА"`). Each source silently seeds its own seen-set from whatever's already there on first run (so history isn't dumped into the channel), then announces only new items — title only, no description, to stay within the mesh's tight per-message byte limit — capped at `max_per_poll` per poll to avoid flooding after downtime. Dedup state lives in `log/alerts/<source name>.txt`.
+
+**Advert beacon:** the `Advert` section configures `internal/beacon` to periodically make the device emit its own advert — `flood_interval_hours` (mesh-wide, every repeater rebroadcasts) and `direct_interval_min` (single hop, direct neighbors only), each `0` = off. Opt-in via `enabled` (default false; a missing section keeps it off). Periods are validated at startup: flood ≥ 1 hour, direct ≥ 1 minute, at least one nonzero period when enabled. The advertised identity is whatever the device already has stored (the bot never pushes name/coords); the first send happens after one full period, not at startup; sends skip with a warning while the device is disconnected. Sends bypass the dispatcher queue and call `client.SendSelfAdvert` directly, same as the on-demand `.advert` command.
 
 ## Key conventions
 

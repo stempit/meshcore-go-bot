@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/stempit/meshcore-go"
+	"github.com/stempit/meshcore-go-bot/internal/beacon"
 	"github.com/stempit/meshcore-go-bot/internal/bridge/alerts"
 	"github.com/stempit/meshcore-go-bot/internal/bridge/mqttbridge"
 	"github.com/stempit/meshcore-go-bot/internal/bridge/tgbridge"
@@ -339,6 +340,22 @@ drainLoop:
 			}
 		}
 	}()
+
+	// ─── Periodic advert beacon ───────────────────────────────────────────────
+	// Makes the device emit its own advert on configurable periods (flood in
+	// hours, direct in minutes). The first send happens after one full period,
+	// not at startup. Optional: a missing or disabled section keeps it off.
+
+	var advertCfg beacon.Config
+	bridgeCfg("Advert", &advertCfg)
+	if advertCfg.Enabled {
+		if err := advertCfg.Validate(); err != nil {
+			log().Error("Invalid Advert config", "error", err)
+			os.Exit(1)
+		}
+		go beacon.New(client, advertCfg).Run(ctx)
+		log().Info("Advert beacon enabled", "flood_every_hours", advertCfg.FloodIntervalHours, "direct_every_min", advertCfg.DirectIntervalMin)
+	}
 
 	// ─── Initial stats ────────────────────────────────────────────────────────
 
