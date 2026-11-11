@@ -9,7 +9,7 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/ollama/ollama v0.40.11
 	github.com/revrost/go-openrouter v1.8.0
-	github.com/stempit/meshcore-go v0.2.0
+	github.com/stempit/meshcore-go v0.3.1
 	github.com/stempit/meshcore-kit v0.2.0
 	golang.org/x/net v0.61.0
 	gopkg.in/yaml.v3 v3.0.1

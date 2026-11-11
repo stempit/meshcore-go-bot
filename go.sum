@@ -48,6 +48,8 @@ github.com/soypat/seqs v0.0.0-20260125140838-2c1c6b1bd69e h1:xF3R+8683ngGNUeIy8P
 github.com/soypat/seqs v0.0.0-20260125140838-2c1c6b1bd69e/go.mod h1:oCVCNGCHMKoBj97Zp9znLbQ1nHxpkmOY9X+UAGzOxc8=
 github.com/stempit/meshcore-go v0.2.0 h1:go/auZf0fQfm1n4VqpxG7AyUivUov9htCJwuY/tK4HA=
 github.com/stempit/meshcore-go v0.2.0/go.mod h1:h00UZ3xwDS0MSoy9hHaEj95VTtMXghhTP5z7D88TwyQ=
+github.com/stempit/meshcore-go v0.3.1 h1:PuT9z1wPlLFxwJBbMLtqnbJj1lVG/AatqUrqn8EdA5M=
+github.com/stempit/meshcore-go v0.3.1/go.mod h1:h00UZ3xwDS0MSoy9hHaEj95VTtMXghhTP5z7D88TwyQ=
 github.com/stempit/meshcore-kit v0.2.0 h1:2LGOSjDi5phm/nMy5D+UaEiQISCHKCWBaavudD1Up0g=
 github.com/stempit/meshcore-kit v0.2.0/go.mod h1:Uhxvpv1Eo5ccKhJ/+b4+/z8hfYLW+OTxsH6gW59eLkA=
 github.com/stretchr/testify v1.2.2/go.mod h1:a8OnRcib4nhh0OaRAV+Yts87kKdq0PP7pXfy6kDkUVs=
