@@ -19,6 +19,7 @@ import (
 	_ "github.com/stempit/meshcore-go-bot/internal/commands/allcommands" // self-registering command plugins
 	"github.com/stempit/meshcore-go-bot/internal/commands/room"
 	"github.com/stempit/meshcore-go-bot/internal/commands/ticket"
+	"github.com/stempit/meshcore-go-bot/internal/commands/trace"
 	"github.com/stempit/meshcore-go-bot/internal/config"
 	"github.com/stempit/meshcore-go-bot/internal/dispatch"
 	"github.com/stempit/meshcore-go-bot/internal/greeter"
@@ -162,6 +163,12 @@ func main() {
 			return client.FindContactByKeyPrefix([]byte(rawKey)[:min(6, len(rawKey))])
 		},
 		d.SendDirectMessage)
+
+	// The .trace full command enumerates every path the message was heard on:
+	// feed raw receptions into the collector and hand it to the plugin.
+	traceCollector := trace.NewCollector(client)
+	client.OnRawData(traceCollector.Observe)
+	trace.SetCollector(traceCollector)
 
 	// ─── Greet new nodes + hash migration nudge ───────────────────────────────
 

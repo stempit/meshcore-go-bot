@@ -46,12 +46,19 @@ const HelpName = "help"
 // network round-trip inside the room's store lock would stall every command.
 const RoomName = "room"
 
+// TraceName is the shrink variant key for the .trace command: path hex hashes
+// and hop counts are structural diagnostics. A truncated list drops whole
+// paths and an LLM rewriting hex hashes corrupts them, so trace output is
+// always split, whatever the Shrink config says. Bare ".trace" output fits a
+// single message anyway; the rule matters for ".trace full" path lists.
+const TraceName = "trace"
+
 // OptionsFor resolves the fit options for a named send path from the Shrink
 // config section, variant overrides included.
 func OptionsFor(name string) fit.Options {
 	s := config.Get().Shrink
 	variant := resolveVariant(name)
-	if name == HelpName || name == RoomName {
+	if name == HelpName || name == RoomName || name == TraceName {
 		variant = fit.Split // verbatim content survives, whatever the config says
 	}
 	o := fit.Options{

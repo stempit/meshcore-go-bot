@@ -1,4 +1,15 @@
 # Trace. Only the leading labels are localized; distances/units stay technical.
-help.long: ".trace — hop count & distance from last ping"
+help.long: ".trace — hop count & distance from last ping\n.trace full — all paths the message was heard on (collects for a few seconds)"
 direct: "Trace direct"
 hops: "Trace %d hops"
+# .trace full. Path lines ([hash] delay + total path km) stay technical; the
+# delay is measured from the first heard copy.
+full.paths: "%d paths in %ds"
+full.direct: "[direct]"
+full.sec: "(%.1fs)"
+full.first: "(*)"
+full.km: "%.1fkm"
+full.m: "%.0fm"
+full.none: "no other copies heard"
+full.busy: "trace busy, try again"
+full.usage: ".trace [full]"

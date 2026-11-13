@@ -4,6 +4,20 @@ type TraceConfig struct {
 	UseConfigCoords bool    `yaml:"use_config_coords"`
 	Lat             float64 `yaml:"lat"`
 	Lon             float64 `yaml:"lon"`
+	// FullEnabled gates the ".trace full" all-paths collection. nil/absent →
+	// enabled; set false to answer ".trace full" with the bare trace.
+	FullEnabled *bool `yaml:"full_enabled"`
+	// CollectWindowSec is how long ".trace full" keeps listening for further
+	// copies of the command message (flood propagation takes seconds on long
+	// paths). Clamped to [3, 30] at use site; 0 → default 15.
+	CollectWindowSec int `yaml:"collect_window_sec"`
+	// MaxPaths caps how many distinct paths ".trace full" reports; each path is
+	// a reply line. 0 → default 8.
+	MaxPaths int `yaml:"max_paths"`
+	// ShowNames renders ".trace full" hops as repeater names from the contact
+	// list instead of key hashes; hops not in contacts fall back to the hash.
+	// nil/absent → enabled.
+	ShowNames *bool `yaml:"show_names"`
 }
 
 type SecurityListConfig struct {

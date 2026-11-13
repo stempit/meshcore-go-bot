@@ -1,4 +1,5 @@
-// Package trace answers .trace with hop count and distance from the last ping.
+// Package trace answers .trace with hop count and distance from the last ping,
+// and .trace full with every path the message was heard on.
 package trace
 
 import (
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/stempit/meshcore-go-bot/internal/config"
 	"github.com/stempit/meshcore-go-bot/internal/support/i18n"
 	"github.com/stempit/meshcore-go-bot/internal/support/registry"
 )
@@ -22,13 +24,21 @@ func init() { registry.Register(plugin{}) }
 
 type plugin struct{}
 
+// collector is the ".trace full" path collector, wired at startup (bot.go,
+// same injection pattern as room.SetDelivery). nil when not wired — then
+// "full" falls back to the bare rendering with a "no other copies" note.
+var collector *Collector
+
+// SetCollector wires the path collector.
+func SetCollector(c *Collector) { collector = c }
+
 func (plugin) Meta() registry.Meta {
 	return registry.Meta{
 		Name:      "trace",
 		Triggers:  []string{".trace"},
-		Match:     registry.Exact,
-		HelpShort: "hop count & distance",
-		HelpLong:  ".trace — hop count & distance from last ping",
+		Match:     registry.Prefix,
+		HelpShort: "hop count & distance; .trace full: all paths",
+		HelpLong:  ".trace — hop count & distance from last ping; .trace full — all paths heard",
 		Group:     "Service",
 	}
 }
@@ -37,7 +47,190 @@ func (plugin) Meta() registry.Meta {
 func (plugin) LocalizedHelp(lang string) string { return tr.T(lang, "help.long") }
 
 func (plugin) Handle(c registry.Ctx) ([]string, error) {
-	return []string{formatTechPong(c.Lang, c.PingMeta)}, nil
+	switch c.Rest {
+	case "":
+		return []string{formatTechPong(c.Lang, c.PingMeta)}, nil
+	case "full":
+		return []string{handleFull(c)}, nil
+	default:
+		return []string{tr.T(c.Lang, "full.usage")}, nil
+	}
+}
+
+// handleFull collects every path the command message was heard on and renders
+// them as one \n-joined message, shortest route first. Each line carries the
+// route's delivery delay (time after the first heard copy — flood propagation
+// through that route) plus the total repeater-based path distance when it is
+// fully computable; the direct self→sender distance is deliberately omitted —
+// it is the same for every path and only the route totals differ. Without a
+// wired collector (or when nothing but the first copy was heard) it falls
+// back to the bare rendering plus a note; disabled by config it just answers
+// bare.
+func handleFull(c registry.Ctx) string {
+	bare := formatTechPong(c.Lang, c.PingMeta)
+	if !fullEnabled(traceCfg(c)) {
+		return bare
+	}
+	if collector == nil {
+		return bare + "\n" + tr.T(c.Lang, "full.none")
+	}
+	match, window := buildMatch(c)
+	if match == nil {
+		return bare + "\n" + tr.T(c.Lang, "full.none")
+	}
+	entries, busy := collector.Collect(match, window)
+	if busy {
+		return tr.T(c.Lang, "full.busy")
+	}
+	if max := maxPaths(traceCfg(c)); len(entries) > max {
+		entries = entries[:max]
+	}
+	if len(entries) == 0 {
+		return bare + "\n" + tr.T(c.Lang, "full.none")
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, tr.T(c.Lang, "full.paths"), len(entries), int(window.Seconds()))
+	names := showNames(traceCfg(c))
+	for _, e := range entries {
+		sb.WriteString("\n")
+		writePathLine(&sb, c.Lang, c.PingMeta, e, names)
+	}
+	return sb.String()
+}
+
+// fullEnabled reports whether ".trace full" is enabled; absent config means
+// enabled.
+func fullEnabled(cfg config.TraceConfig) bool {
+	return cfg.FullEnabled == nil || *cfg.FullEnabled
+}
+
+// showNames reports whether ".trace full" hops render as repeater names;
+// absent config means enabled (unknown hops still fall back to the hash).
+func showNames(cfg config.TraceConfig) bool {
+	return cfg.ShowNames == nil || *cfg.ShowNames
+}
+
+// buildMatch derives the raw-packet matcher for the command message plus the
+// collection window from config. It returns a nil match when the message
+// cannot be correlated on air: a DM without our own key byte (self info not
+// synced yet) or a channel without a usable PSK cannot be told apart from
+// other traffic, and a wrong-path report is worse than a short one.
+func buildMatch(c registry.Ctx) (Match, time.Duration) {
+	window := collectWindow(traceCfg(c))
+	if c.IsDM() {
+		if len(c.SenderKey) == 0 {
+			return nil, 0
+		}
+		selfKey0, ok := collector.SelfKeyByte()
+		if !ok {
+			return nil, 0
+		}
+		return DMMatch(selfKey0, c.SenderKey[0], len(c.Text)), window
+	}
+	psk := collector.ChannelPSK(c.Channel)
+	if len(psk) < 16 || c.PingMeta == nil {
+		return nil, 0
+	}
+	return ChannelMatch(psk, uint32(c.PingMeta.Timestamp.Unix()), c.SenderName, c.Text), window
+}
+
+// traceCfg reads the Trace config section, tolerating a nil Cfg (tests).
+func traceCfg(c registry.Ctx) config.TraceConfig {
+	if c.Cfg == nil {
+		return config.TraceConfig{}
+	}
+	return c.Cfg.Trace
+}
+
+// collectWindow resolves the ".trace full" listening window from config,
+// clamped so a typo cannot stall the worker pool for a minute or blink.
+func collectWindow(cfg config.TraceConfig) time.Duration {
+	s := cfg.CollectWindowSec
+	if s <= 0 {
+		s = 15
+	}
+	return time.Duration(min(30, max(3, s))) * time.Second
+}
+
+// maxPaths resolves the reported-path cap from config; 0 → default 8.
+func maxPaths(cfg config.TraceConfig) int {
+	if cfg.MaxPaths <= 0 {
+		return 8
+	}
+	return cfg.MaxPaths
+}
+
+// writePathLine renders one path entry in the bare trace's style: [hash or
+// repeater name] (delivery delay) distance — where the delay sits in
+// parentheses and the distance carries the bare trace's "+" marker when the
+// sender position is unknown and the chain stops at the last hop. Hash sizes
+// of 1–4 bytes per hop are supported; distances stay technical (metres below
+// 1 km). Names come from the contact list and only replace the hash when
+// known and showNames is set.
+func writePathLine(sb *strings.Builder, lang string, meta *registry.PingMeta, e PathEntry, names bool) {
+	if e.Hops > 0 && len(e.Path)%e.Hops == 0 {
+		bph := len(e.Path) / e.Hops
+		for i := 0; i < e.Hops; i++ {
+			if names && i < len(e.Names) && e.Names[i] != "" {
+				fmt.Fprintf(sb, "[%s]", e.Names[i])
+			} else {
+				fmt.Fprintf(sb, "[%s]", strings.ToUpper(hex.EncodeToString(e.Path[i*bph:(i+1)*bph])))
+			}
+		}
+		sb.WriteString(" ")
+	} else if e.Hops == 0 {
+		sb.WriteString(tr.T(lang, "full.direct"))
+		sb.WriteString(" ")
+	}
+	if e.Delay == 0 {
+		// The baseline: the first copy heard, all delays are relative to it.
+		sb.WriteString(tr.T(lang, "full.first"))
+	} else {
+		fmt.Fprintf(sb, tr.T(lang, "full.sec"), e.Delay.Seconds())
+	}
+	if km, approx, ok := pathKm(meta, e); ok {
+		sb.WriteString(" ")
+		if km < 1 {
+			fmt.Fprintf(sb, tr.T(lang, "full.m"), km*1000)
+		} else {
+			fmt.Fprintf(sb, tr.T(lang, "full.km"), km)
+		}
+		if approx {
+			sb.WriteString("+")
+		}
+	}
+}
+
+// pathKm totals the route self → hop1 → … → sender, the same haversine chain
+// formatTechPong walks for the first path. With the sender position known the
+// total is exact; without it the chain stops at the last hop — a minimum
+// estimate rendered with the bare trace's "+" marker. ok is false when the
+// chain is broken (an unknown hop) or there is nothing to total (direct
+// delivery without sender coords), in which case the line shows no distance.
+func pathKm(meta *registry.PingMeta, e PathEntry) (km float64, approx, ok bool) {
+	if meta == nil || len(e.HopCoords) != e.Hops || len(e.Known) != e.Hops {
+		return 0, false, false
+	}
+	for _, k := range e.Known {
+		if !k {
+			return 0, false, false
+		}
+	}
+	total := 0.0
+	prevLat, prevLon := meta.SelfLat, meta.SelfLon
+	for _, crd := range e.HopCoords {
+		total += haversineKm(prevLat, prevLon, crd[0], crd[1])
+		prevLat, prevLon = crd[0], crd[1]
+	}
+	if meta.SenderLat != nil && meta.SenderLon != nil {
+		total += haversineKm(prevLat, prevLon, *meta.SenderLat, *meta.SenderLon)
+		return total, false, true
+	}
+	if e.Hops > 0 {
+		return total, true, true
+	}
+	return 0, false, false
 }
 
 // haversineKm returns the great-circle distance in km between two lat/lon points.
