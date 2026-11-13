@@ -1,9 +1,11 @@
 // Collector: ".trace full" support. The firmware pushes a 0x88 raw frame for
-// every RF reception — pre-dedup — so a flood-routed message heard via several
-// repeater chains arrives once per chain, each copy carrying its own
-// accumulated path. meshcore-go correlates only the first copy with the
-// decoded frame (that is what PingMeta shows); the Collector buffers every
-// copy from the OnRawData callback, so ".trace full" can enumerate all of them.
+// every RF reception — pre-dedup. meshcore-go correlates only the first copy
+// with the decoded frame (that is what PingMeta shows); the Collector buffers
+// every copy from the OnRawData callback, so ".trace full" can enumerate all
+// routes. Flood-routed receptions accumulate a hash per forwarder — one
+// distinct path per chain. Direct-routed receptions carry an explicit path
+// that each forwarder consumes (strips its own hash) — the copies are stages
+// of one delivery, [A,B] → [B] → [], and collapse into a single entry.
 package trace
 
 import (
@@ -20,11 +22,17 @@ import (
 	"github.com/stempit/meshcore-go"
 )
 
-// Raw packet payload types the collector distinguishes (Packet.h constants;
-// same values mqttbridge/packet_wire.go documents for the analyzer).
+// Raw packet payload and route types the collector distinguishes (Packet.h
+// constants; same values mqttbridge/packet_wire.go documents for the
+// analyzer).
 const (
 	payloadTypeTxtMsg = 0x02 // PAYLOAD_TYPE_TXT_MSG — direct message
 	payloadTypeGrpTxt = 0x05 // PAYLOAD_TYPE_GRP_TXT — channel message
+
+	routeTypeFlood          = 0x01 // ROUTE_TYPE_FLOOD — hash accumulates per forwarder
+	routeTypeDirect         = 0x02 // ROUTE_TYPE_DIRECT — explicit path
+	routeTypeTransportFlood = 0x00 // ROUTE_TYPE_TRANSPORT_FLOOD
+	routeTypeTransportDir   = 0x03 // ROUTE_TYPE_TRANSPORT_DIRECT — explicit path + codes
 )
 
 const (
@@ -96,14 +104,22 @@ type PathEntry struct {
 // It receives the ParseRawPacket split so DM and channel rules differ freely.
 type Match func(ptype byte, path []byte, hops int, payload []byte) bool
 
-// Collect returns every distinct path the message was heard on: matched
-// entries already in the look-back buffer plus live arrivals for the window's
-// remainder. Paths dedup by content (all direct copies collapse into one
-// 0-hop entry, keeping the earliest arrival), Delay is computed against the
-// earliest arrival overall, and entries come back sorted by hop count. busy
-// is true (with no entries) when another collection is already running —
-// Handle replies "busy" instead of stacking a second window-length hold on
-// the worker pool.
+// Collect returns every distinct route the message was heard on: matched
+// receptions already in the look-back buffer plus live arrivals for the
+// window's remainder. Route families behave differently:
+//
+//   - Direct-routed copies (explicit path) are stages of one delivery —
+//     MeshCore consumes the path hop by hop, each forwarder stripping its own
+//     hash, so [A,B] → [B] → [] is one route heard once per hop, not three.
+//     They collapse into a single entry showing the route as sent; Delay is
+//     the end-to-end delivery time (final stage − first stage).
+//   - Flood-routed copies accumulate hashes per forwarder, so each distinct
+//     path is a genuinely different route; Delay is that route's arrival
+//     relative to the earliest flood copy.
+//
+// Entries come back sorted by hop count. busy is true (with no entries) when
+// another collection is already running — Handle replies "busy" instead of
+// stacking a second window-length hold on the worker pool.
 func (c *Collector) Collect(match Match, window time.Duration) (entries []PathEntry, busy bool) {
 	c.mu.Lock()
 	if c.collecting {
@@ -126,9 +142,9 @@ func (c *Collector) Collect(match Match, window time.Duration) (entries []PathEn
 		contacts = c.client.GetContacts()
 	}
 
-	seen := make(map[string]int) // path key -> index into found
-	var found []PathEntry
-	var arrivals []time.Time
+	// Gather every matched reception whole — grouping by route family happens
+	// once after the window, not per tick.
+	var copies []rxCopy
 	deadline := time.Now().Add(window)
 	for {
 		c.mu.Lock()
@@ -137,16 +153,12 @@ func (c *Collector) Collect(match Match, window time.Duration) (entries []PathEn
 			if !ok || !match(ptype, path, hops, payload) {
 				continue
 			}
-			key := string(path) // empty key collapses all direct copies into one
-			if idx, dup := seen[key]; dup {
-				if rx.At.Before(arrivals[idx]) {
-					arrivals[idx] = rx.At
-				}
-				continue
-			}
-			seen[key] = len(found)
-			found = append(found, PathEntry{Path: append([]byte(nil), path...), Hops: hops})
-			arrivals = append(arrivals, rx.At)
+			copies = append(copies, rxCopy{
+				route: rx.Data[0] & 0x03,
+				path:  append([]byte(nil), path...),
+				hops:  hops,
+				at:    rx.At,
+			})
 		}
 		c.mu.Unlock()
 
@@ -156,15 +168,107 @@ func (c *Collector) Collect(match Match, window time.Duration) (entries []PathEn
 		time.Sleep(collectTick)
 	}
 
-	if len(found) > 0 {
-		baseline := slices.MinFunc(arrivals, time.Time.Compare)
-		for i := range found {
-			found[i].Delay = arrivals[i].Sub(baseline)
-			found[i].HopCoords, found[i].Known, found[i].Names = resolveHops(found[i].Path, found[i].Hops, contacts)
-		}
+	found := groupCopies(copies)
+	for i := range found {
+		found[i].HopCoords, found[i].Known, found[i].Names = resolveHops(found[i].Path, found[i].Hops, contacts)
 	}
 	sort.SliceStable(found, func(i, j int) bool { return found[i].Hops < found[j].Hops })
 	return found, false
+}
+
+// rxCopy is one matched raw reception, kept whole until the window closes so
+// direct-route stages can be grouped into their delivery chain.
+type rxCopy struct {
+	route byte
+	path  []byte
+	hops  int
+	at    time.Time
+}
+
+// directChain accumulates the heard stages of one direct-routed delivery.
+type directChain struct {
+	full      []byte    // longest heard path = the route as sent
+	hops      int       // hash count of the full path
+	minHops   int       // shallowest heard stage (0 = final delivery)
+	first     time.Time // earliest stage arrival
+	delivered time.Time // earliest arrival of the shallowest stage
+}
+
+// groupCopies splits receptions by route family and builds the report entries:
+// one per direct-route chain, one per distinct flood path.
+func groupCopies(copies []rxCopy) []PathEntry {
+	var found []PathEntry
+
+	// Direct-routed: stages of the same chain share suffix paths — each
+	// forwarder strips its own hash, so a stage's path is a suffix of the
+	// route as sent. Longest-first ordering makes the full route found first.
+	var direct []rxCopy
+	var flood []rxCopy
+	for _, cp := range copies {
+		if cp.route == routeTypeDirect || cp.route == routeTypeTransportDir {
+			direct = append(direct, cp)
+		} else {
+			flood = append(flood, cp)
+		}
+	}
+	sort.SliceStable(direct, func(i, j int) bool {
+		if direct[i].hops != direct[j].hops {
+			return direct[i].hops > direct[j].hops
+		}
+		return direct[i].at.Before(direct[j].at)
+	})
+	var chains []*directChain
+	for _, cp := range direct {
+		joined := false
+		for _, ch := range chains {
+			if !bytes.HasSuffix(ch.full, cp.path) {
+				continue
+			}
+			joined = true
+			if cp.at.Before(ch.first) {
+				ch.first = cp.at
+			}
+			if cp.hops < ch.minHops {
+				ch.minHops, ch.delivered = cp.hops, cp.at
+			} else if cp.hops == ch.minHops && cp.at.Before(ch.delivered) {
+				ch.delivered = cp.at
+			}
+			break
+		}
+		if !joined {
+			chains = append(chains, &directChain{full: cp.path, hops: cp.hops, minHops: cp.hops, first: cp.at, delivered: cp.at})
+		}
+	}
+	for _, ch := range chains {
+		found = append(found, PathEntry{Path: ch.full, Hops: ch.hops, Delay: ch.delivered.Sub(ch.first)})
+	}
+
+	// Flood-routed: each distinct path is a route of its own; keep the
+	// earliest arrival per path and measure delays from the earliest flood
+	// copy (the flood family's own baseline).
+	if len(flood) > 0 {
+		floodStart := len(found)
+		seen := make(map[string]int) // path key -> index into arrivals
+		var arrivals []time.Time
+		for _, cp := range flood {
+			key := string(cp.path) // empty key collapses all in-range copies into one
+			if idx, dup := seen[key]; dup {
+				if cp.at.Before(arrivals[idx]) {
+					arrivals[idx] = cp.at
+				}
+				continue
+			}
+			seen[key] = len(arrivals)
+			found = append(found, PathEntry{Path: cp.path, Hops: cp.hops})
+			arrivals = append(arrivals, cp.at)
+		}
+		baseline := slices.MinFunc(arrivals, time.Time.Compare)
+		for i := range arrivals {
+			found[floodStart+i].Delay = arrivals[i].Sub(baseline)
+		}
+	}
+
+	return found
 }
 
 // resolveHops resolves each hop of a path against the contact list — lat/lon

@@ -57,12 +57,12 @@ func TestHandleFullRendersPaths(t *testing.T) {
 	// Copy #1 and #2: already in the buffer when Handle runs, both at the
 	// same instant — tied for first-heard, so both render the (*) baseline.
 	base := time.Now()
-	col.Observe(meshcore.RawRx{Data: buildTXTMSG(0x42, 0x11, []byte{0xAA}, 16), At: base})
-	col.Observe(meshcore.RawRx{Data: buildTXTMSG(0x42, 0x11, []byte{0xAA, 0xBB}, 16), At: base})
+	col.Observe(meshcore.RawRx{Data: buildFloodTXTMSG(0x42, 0x11, []byte{0xAA}, 16), At: base})
+	col.Observe(meshcore.RawRx{Data: buildFloodTXTMSG(0x42, 0x11, []byte{0xAA, 0xBB}, 16), At: base})
 	// Copy #3: lands mid-window, like a longer flood route arriving late.
 	go func() {
 		time.Sleep(500 * time.Millisecond)
-		col.Observe(meshcore.RawRx{Data: buildTXTMSG(0x42, 0x11, nil, 16), At: time.Now()})
+		col.Observe(meshcore.RawRx{Data: buildFloodTXTMSG(0x42, 0x11, nil, 16), At: time.Now()})
 	}()
 
 	pm := &registry.PingMeta{
@@ -118,7 +118,7 @@ func TestHandleFullDistanceOmittedWhenUnknown(t *testing.T) {
 	col := NewCollector(src)
 	t.Cleanup(func() { collector = nil })
 	collector = col
-	col.Observe(meshcore.RawRx{Data: buildTXTMSG(0x42, 0x11, []byte{0xAA, 0xBB}, 16), At: time.Now()})
+	col.Observe(meshcore.RawRx{Data: buildFloodTXTMSG(0x42, 0x11, []byte{0xAA, 0xBB}, 16), At: time.Now()})
 
 	pm := &registry.PingMeta{SenderLat: f64(3), SenderLon: f64(0)}
 	cfg := &config.Config{Trace: config.TraceConfig{CollectWindowSec: 3}}
@@ -149,7 +149,7 @@ func TestHandleFullApproxDistance(t *testing.T) {
 	col := NewCollector(src)
 	t.Cleanup(func() { collector = nil })
 	collector = col
-	col.Observe(meshcore.RawRx{Data: buildTXTMSG(0x42, 0x11, []byte{0xAA, 0xBB}, 16), At: time.Now()})
+	col.Observe(meshcore.RawRx{Data: buildFloodTXTMSG(0x42, 0x11, []byte{0xAA, 0xBB}, 16), At: time.Now()})
 
 	pm := &registry.PingMeta{SenderLat: nil, SenderLon: nil} // sender position unknown
 	cfg := &config.Config{Trace: config.TraceConfig{CollectWindowSec: 3}}
@@ -181,7 +181,7 @@ func TestHandleFullHopNames(t *testing.T) {
 	col := NewCollector(src)
 	t.Cleanup(func() { collector = nil })
 	collector = col
-	col.Observe(meshcore.RawRx{Data: buildTXTMSG(0x42, 0x11, []byte{0xAA, 0xBB}, 16), At: time.Now()})
+	col.Observe(meshcore.RawRx{Data: buildFloodTXTMSG(0x42, 0x11, []byte{0xAA, 0xBB}, 16), At: time.Now()})
 
 	pm := &registry.PingMeta{SenderLat: nil, SenderLon: nil}
 	leg := haversineKm(0, 0, 1, 0)
@@ -218,7 +218,7 @@ func TestHandleFullDisabled(t *testing.T) {
 	col := NewCollector(src)
 	t.Cleanup(func() { collector = nil })
 	collector = col
-	col.Observe(meshcore.RawRx{Data: buildTXTMSG(0x42, 0x11, []byte{0xAA}, 16), At: time.Now()})
+	col.Observe(meshcore.RawRx{Data: buildFloodTXTMSG(0x42, 0x11, []byte{0xAA}, 16), At: time.Now()})
 
 	disabled := false
 	pm := &registry.PingMeta{PathLength: 0xFF}

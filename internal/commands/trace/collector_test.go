@@ -25,7 +25,16 @@ func (s stubSource) GetContacts() map[string]*meshcore.Contact   { return s.cont
 // [path…][dest_hash][src_hash][mac(2)][ciphertext…]. The DM matcher only sees
 // the hashes and the ciphertext length, so the ciphertext is filler.
 func buildTXTMSG(dest, src byte, path []byte, ctLen int) []byte {
-	raw := []byte{0x0A, byte(len(path))}
+	raw := []byte{0x0A, byte(len(path))} // header: ROUTE_TYPE_DIRECT | TXT_MSG
+	raw = append(raw, path...)
+	raw = append(raw, dest, src, 0x01, 0x02)
+	return append(raw, make([]byte, ctLen)...)
+}
+
+// buildFloodTXTMSG is buildTXTMSG with a flood header: flood-routed DMs
+// accumulate a hash per forwarder, so distinct paths are distinct routes.
+func buildFloodTXTMSG(dest, src byte, path []byte, ctLen int) []byte {
+	raw := []byte{0x09, byte(len(path))} // header: ROUTE_TYPE_FLOOD | TXT_MSG
 	raw = append(raw, path...)
 	raw = append(raw, dest, src, 0x01, 0x02)
 	return append(raw, make([]byte, ctLen)...)
@@ -77,17 +86,18 @@ func TestCollectDMPathsAcrossCopies(t *testing.T) {
 
 	// Explicit arrival times pin the delay computation: the [AA] copy is the
 	// earliest (baseline), later routes show their propagation delay, and a
-	// duplicate [AA] copy does not move the baseline.
+	// duplicate [AA] copy does not move the baseline. Flood header: distinct
+	// paths are distinct routes.
 	base := time.Now()
-	col.Observe(meshcore.RawRx{Data: buildTXTMSG(0x42, 0x11, []byte{0xAA}, ct), At: base})
-	col.Observe(meshcore.RawRx{Data: buildTXTMSG(0x42, 0x11, []byte{0xAA, 0xBB}, ct), At: base.Add(time.Second)})
-	col.Observe(meshcore.RawRx{Data: buildTXTMSG(0x42, 0x11, []byte{0xAA}, ct), At: base.Add(300 * time.Millisecond)})      // duplicate path
-	col.Observe(meshcore.RawRx{Data: buildTXTMSG(0x42, 0x11, nil, ct), At: base.Add(2 * time.Second)})                      // direct copy
-	col.Observe(meshcore.RawRx{Data: buildTXTMSG(0x42, 0x99, []byte{0xCC}, ct), At: base})                                  // other sender
-	col.Observe(meshcore.RawRx{Data: buildTXTMSG(0x77, 0x11, []byte{0xDD}, ct), At: base})                                  // other dest
-	col.Observe(meshcore.RawRx{Data: buildTXTMSG(0x42, 0x11, []byte{0xEE}, 48), At: base})                                  // wrong ct length (neither plain nor signed)
-	col.Observe(meshcore.RawRx{Data: buildTXTMSG(0x42, 0x11, []byte{0xFF}, signed), At: base.Add(1500 * time.Millisecond)}) // signed-DM length (ts+flags+sender_prefix+text)
-	col.Observe(meshcore.RawRx{Data: buildGRP(make([]byte, 16), 1, "Alice: hi", []byte{0x11}), At: base})                   // not a DM
+	col.Observe(meshcore.RawRx{Data: buildFloodTXTMSG(0x42, 0x11, []byte{0xAA}, ct), At: base})
+	col.Observe(meshcore.RawRx{Data: buildFloodTXTMSG(0x42, 0x11, []byte{0xAA, 0xBB}, ct), At: base.Add(time.Second)})
+	col.Observe(meshcore.RawRx{Data: buildFloodTXTMSG(0x42, 0x11, []byte{0xAA}, ct), At: base.Add(300 * time.Millisecond)})      // duplicate path
+	col.Observe(meshcore.RawRx{Data: buildFloodTXTMSG(0x42, 0x11, nil, ct), At: base.Add(2 * time.Second)})                      // direct copy
+	col.Observe(meshcore.RawRx{Data: buildFloodTXTMSG(0x42, 0x99, []byte{0xCC}, ct), At: base})                                  // other sender
+	col.Observe(meshcore.RawRx{Data: buildFloodTXTMSG(0x77, 0x11, []byte{0xDD}, ct), At: base})                                  // other dest
+	col.Observe(meshcore.RawRx{Data: buildFloodTXTMSG(0x42, 0x11, []byte{0xEE}, 48), At: base})                                  // wrong ct length (neither plain nor signed)
+	col.Observe(meshcore.RawRx{Data: buildFloodTXTMSG(0x42, 0x11, []byte{0xFF}, signed), At: base.Add(1500 * time.Millisecond)}) // signed-DM length (ts+flags+sender_prefix+text)
+	col.Observe(meshcore.RawRx{Data: buildGRP(make([]byte, 16), 1, "Alice: hi", []byte{0x11}), At: base})                        // not a DM
 
 	entries, busy := col.Collect(DMMatch(0x42, 0x11, textLen), 300*time.Millisecond)
 	if busy {
@@ -112,6 +122,58 @@ func TestCollectDMPathsAcrossCopies(t *testing.T) {
 	}
 	if string(entries[3].Path) != "\xaa\xbb" || entries[3].Hops != 2 || entries[3].Delay != time.Second {
 		t.Errorf("entry 3 = %+v, want the [AA][BB] route with 1s delay", entries[3])
+	}
+}
+
+// TestCollectDirectRouteCollapsesStages pins the direct-route rule: MeshCore
+// consumes a direct packet's path hop by hop (each forwarder strips its own
+// hash), so the stages [AA,BB] → [BB] → [] are ONE delivery heard once per
+// hop — they collapse into a single entry showing the route as sent, with the
+// end-to-end delivery time as the delay. A sender retry merges into the same
+// chain, keeping the earliest stage arrivals.
+func TestCollectDirectRouteCollapsesStages(t *testing.T) {
+	textLen := len(".trace full")
+	ct := 16 // pad16(5 + 11)
+	col := NewCollector(stubSource{self: &meshcore.SelfInfo{PublicKey: []byte{0x42}}})
+
+	base := time.Now()
+	col.Observe(meshcore.RawRx{Data: buildTXTMSG(0x42, 0x11, []byte{0xAA, 0xBB}, ct), At: base})                       // sender TX, full path
+	col.Observe(meshcore.RawRx{Data: buildTXTMSG(0x42, 0x11, []byte{0xBB}, ct), At: base.Add(500 * time.Millisecond)}) // first repeater stripped itself
+	col.Observe(meshcore.RawRx{Data: buildTXTMSG(0x42, 0x11, nil, ct), At: base.Add(time.Second)})                     // final delivery, path empty
+	// A sender retry re-runs the same stages; the chain keeps the earliest.
+	col.Observe(meshcore.RawRx{Data: buildTXTMSG(0x42, 0x11, []byte{0xAA, 0xBB}, ct), At: base.Add(5 * time.Second)})
+	col.Observe(meshcore.RawRx{Data: buildTXTMSG(0x42, 0x11, nil, ct), At: base.Add(6 * time.Second)})
+
+	entries, busy := col.Collect(DMMatch(0x42, 0x11, textLen), 300*time.Millisecond)
+	if busy {
+		t.Fatal("unexpected busy")
+	}
+	if len(entries) != 1 {
+		t.Fatalf("got %d entries, want 1 collapsed route: %+v", len(entries), entries)
+	}
+	if string(entries[0].Path) != "\xaa\xbb" || entries[0].Hops != 2 {
+		t.Fatalf("entry = %+v, want the route as sent [AA][BB]", entries[0])
+	}
+	if entries[0].Delay != time.Second {
+		t.Fatalf("delay = %v, want the 1s end-to-end delivery time", entries[0].Delay)
+	}
+}
+
+// TestCollectDirectPartialStages pins the under-heard case: when only the
+// later stages are heard (the sender's TX was missed), the chain shows the
+// longest heard path and the spread between the heard stages.
+func TestCollectDirectPartialStages(t *testing.T) {
+	textLen := len(".trace full")
+	ct := 16
+	col := NewCollector(stubSource{self: &meshcore.SelfInfo{PublicKey: []byte{0x42}}})
+
+	base := time.Now()
+	col.Observe(meshcore.RawRx{Data: buildTXTMSG(0x42, 0x11, []byte{0xBB}, ct), At: base})                    // first stage heard
+	col.Observe(meshcore.RawRx{Data: buildTXTMSG(0x42, 0x11, nil, ct), At: base.Add(300 * time.Millisecond)}) // delivery
+
+	entries, _ := col.Collect(DMMatch(0x42, 0x11, textLen), 300*time.Millisecond)
+	if len(entries) != 1 || string(entries[0].Path) != "\xbb" || entries[0].Delay != 300*time.Millisecond {
+		t.Fatalf("entries = %+v, want the [BB] chain with 0.3s spread", entries)
 	}
 }
 
