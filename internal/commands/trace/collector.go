@@ -143,7 +143,15 @@ func (c *Collector) Collect(match Match, window time.Duration) (entries []PathEn
 	}
 
 	// Gather every matched reception whole — grouping by route family happens
-	// once after the window, not per tick.
+	// once after the window, not per tick. The buffer is re-scanned each tick,
+	// so receptions dedup by their exact identity (the stored arrival time is
+	// fixed per buffer entry): only genuinely new receptions get recorded.
+	type rxKey struct {
+		route byte
+		path  string
+		at    time.Time
+	}
+	seen := make(map[rxKey]bool)
 	var copies []rxCopy
 	deadline := time.Now().Add(window)
 	for {
@@ -153,8 +161,14 @@ func (c *Collector) Collect(match Match, window time.Duration) (entries []PathEn
 			if !ok || !match(ptype, path, hops, payload) {
 				continue
 			}
+			route := rx.Data[0] & 0x03
+			key := rxKey{route: route, path: string(path), at: rx.At}
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
 			copies = append(copies, rxCopy{
-				route: rx.Data[0] & 0x03,
+				route: route,
 				path:  append([]byte(nil), path...),
 				hops:  hops,
 				at:    rx.At,
